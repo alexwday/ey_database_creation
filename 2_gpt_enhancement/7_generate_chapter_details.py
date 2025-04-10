@@ -508,16 +508,18 @@ def get_chapter_level_details(chapter_number, chapter_chunks_data, client, model
 # ============ DATA LOADING FOR TESTING ============
 
 def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
-    """Loads all chunk JSONs and groups them by chapter_number."""
-    grouped_by_chapter = defaultdict(list)
-    print(f"Loading and grouping chunks from: {input_dir}")
+    """
+    Loads all chunk JSONs, sorts them by the 'order' field within the JSON,
+    and then groups them by chapter_number.
+    """
+    all_chunks_data = []
+    print(f"Loading chunks from: {input_dir}")
     try:
         filenames = [f for f in os.listdir(input_dir) if f.endswith(".json")]
         if not filenames:
-            print(f"Error: No JSON files found in {input_dir}")
-            return None
-        filenames = natsort.natsorted(filenames)
-        print(f"Found {len(filenames)} chunk files.")
+            print(f"Warning: No JSON files found in {input_dir}")
+            return None # Changed from returning empty dict to None for consistency
+        print(f"Found {len(filenames)} chunk files. Loading data...")
     except FileNotFoundError:
         print(f"Error: Input directory not found: {input_dir}")
         return None
@@ -528,24 +530,34 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
 
     loaded_count = 0
     error_count = 0
+    skipped_missing_order = 0
     skipped_missing_chapter = 0
+
     for filename in filenames:
         filepath = os.path.join(input_dir, filename)
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
+            # --- Validation ---
+            if 'order' not in data or not isinstance(data['order'], int):
+                print(f"Warning: Missing or invalid 'order' field in {filename}. Skipping.")
+                skipped_missing_order += 1
+                continue
+
             chapter_number = data.get('chapter_number')
             if chapter_number is None:
+                print(f"Warning: Missing 'chapter_number' in {filename} (Order: {data['order']}). Skipping.")
                 skipped_missing_chapter += 1
                 continue
 
             if 'content' not in data or 'chunk_token_count' not in data:
-                 print(f"Warning: Missing 'content' or 'chunk_token_count' in {filename} for chapter {chapter_number}. Skipping.")
+                 print(f"Warning: Missing 'content' or 'chunk_token_count' in {filename} (Order: {data['order']}). Skipping.")
                  error_count += 1
                  continue
+            # --- End Validation ---
 
-            grouped_by_chapter[chapter_number].append(data)
+            all_chunks_data.append(data)
             loaded_count += 1
 
         except json.JSONDecodeError:
@@ -557,17 +569,49 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
             error_count += 1
 
     print(f"Successfully loaded data for {loaded_count} chunks.")
+    if skipped_missing_order > 0:
+        print(f"Skipped {skipped_missing_order} chunks missing or invalid 'order'.")
     if skipped_missing_chapter > 0:
          print(f"Skipped {skipped_missing_chapter} chunks missing 'chapter_number'.")
     if error_count > 0:
         print(f"Skipped {error_count} chunks due to other errors.")
 
-    if not grouped_by_chapter:
-        print("No chunks were successfully loaded and grouped by chapter.")
+    if not all_chunks_data:
+        print("No valid chunks were loaded.")
         return None
 
-    sorted_grouped_by_chapter = dict(natsort.natsorted(grouped_by_chapter.items()))
-    print(f"Grouped data for {len(sorted_grouped_by_chapter)} chapters.")
+    # --- Sort by the 'order' field ---
+    try:
+        all_chunks_data.sort(key=lambda x: x['order'])
+        print(f"Successfully sorted {len(all_chunks_data)} chunks by 'order' field.")
+    except KeyError:
+        # This shouldn't happen due to validation above, but as a safeguard
+        print("Error: Sorting failed because 'order' key was missing in some loaded chunks.")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred during sorting: {e}")
+        traceback.print_exc()
+        return None
+
+    # --- Group by chapter_number ---
+    grouped_by_chapter = defaultdict(list)
+    for chunk in all_chunks_data:
+        grouped_by_chapter[chunk['chapter_number']].append(chunk)
+
+    # --- Sort chapters naturally (optional but good practice) ---
+    # Use natsort if available for chapter keys
+    try:
+        if natsort:
+            sorted_grouped_by_chapter = dict(natsort.natsorted(grouped_by_chapter.items()))
+            print(f"Grouped data into {len(sorted_grouped_by_chapter)} chapters (naturally sorted).")
+        else:
+            # Sort chapter keys using standard sort if natsort is unavailable
+            sorted_grouped_by_chapter = dict(sorted(grouped_by_chapter.items()))
+            print(f"Grouped data into {len(sorted_grouped_by_chapter)} chapters (standard sort).")
+    except Exception as e:
+        print(f"Warning: Could not sort chapter keys: {e}. Returning unsorted chapters.")
+        sorted_grouped_by_chapter = dict(grouped_by_chapter) # Return unsorted if error
+
     return sorted_grouped_by_chapter
 
 
