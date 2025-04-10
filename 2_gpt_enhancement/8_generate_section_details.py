@@ -27,6 +27,7 @@ from collections import defaultdict
 from openai import OpenAI, APIError
 from pathlib import Path
 import tiktoken # Ensure tiktoken is installed
+from tqdm import tqdm # Import tqdm
 
 # --- Configuration ---
 CHUNK_INPUT_DIR = "2E_final_merged_chunks" # Directory containing chunk JSONs
@@ -89,9 +90,15 @@ SECTION_TOOL_SCHEMA = {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "A list of specific standard codes explicitly mentioned or directly relevant in the section (e.g., ['IFRS 16', 'IAS 17']). The number of codes should reflect the section's content. These codes will be used as metadata for search reranking."
+                },
+                "section_importance": {
+                    "type": "number",
+                    "description": "A score between 0.0 (low importance) and 1.0 (high importance) indicating how crucial this section is to understanding the overall chapter's topic. A score of 0.5 indicates average or unknown importance. This float value will be used for search reranking.",
+                    "minimum": 0.0,
+                    "maximum": 1.0
                 }
             },
-            "required": ["section_summary", "section_tags", "section_standard", "section_standard_codes"]
+            "required": ["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance"]
         }
     }
 }
@@ -216,7 +223,7 @@ def _call_gpt_with_retry(client, model, messages, max_tokens, temperature, tools
     last_exception = None
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            logging.info(f"Making API call (Attempt {attempt + 1}/{_RETRY_ATTEMPTS})...")
+            logging.debug(f"Making API call (Attempt {attempt + 1}/{_RETRY_ATTEMPTS})...") # Changed to DEBUG
             completion_kwargs = {
                 "model": model,
                 "messages": messages,
@@ -227,7 +234,7 @@ def _call_gpt_with_retry(client, model, messages, max_tokens, temperature, tools
             if tools and tool_choice:
                 completion_kwargs["tools"] = tools
                 completion_kwargs["tool_choice"] = tool_choice
-                logging.info("Making API call with tool choice...")
+                logging.debug("Making API call with tool choice...") # Changed to DEBUG
             else:
                 # Defaulting to tool use for this script, but keeping structure
                 logging.warning("API call initiated without explicit tool choice - this script expects tool use.")
@@ -235,7 +242,7 @@ def _call_gpt_with_retry(client, model, messages, max_tokens, temperature, tools
                 # completion_kwargs["response_format"] = {"type": "json_object"} # Use if not using tools
 
             response = client.chat.completions.create(**completion_kwargs)
-            logging.info("API call successful.")
+            logging.debug("API call successful.") # Changed to DEBUG
             response_message = response.choices[0].message
 
             # --- Tool Call Handling ---
@@ -318,9 +325,12 @@ def parse_gpt_json_response(response_content_str, expected_keys):
              logging.warning("Type mismatch: 'section_standard' is not a string.")
         if 'section_standard_codes' in expected_keys and not isinstance(data.get('section_standard_codes'), list):
              logging.warning("Type mismatch: 'section_standard_codes' is not a list.")
+        # Accept float or int (for 0 or 1)
+        if 'section_importance' in expected_keys and not isinstance(data.get('section_importance'), (float, int)):
+             logging.warning("Type mismatch: 'section_importance' is not a number (float or int).")
 
 
-        logging.info("GPT JSON response parsed successfully.")
+        logging.debug("GPT JSON response parsed successfully.") # Changed to DEBUG
         return data
     except json.JSONDecodeError as e:
         logging.error(f"Error decoding GPT JSON response: {e}")
@@ -516,6 +526,7 @@ def _build_section_prompt(section_text, chapter_summary, chapter_tags, previous_
     2.  **section_tags:** Generate a list of meaningful, granular tags specific to THIS SECTION's content. The number of tags should be dynamic and reflect the section's complexity and key topics. These tags are crucial metadata for search reranking.
     3.  **section_standard:** Identify the single, primary accounting standard framework most relevant to THIS SECTION (e.g., 'IFRS', 'US GAAP', 'N/A').
     4.  **section_standard_codes:** List specific standard codes (e.g., 'IFRS 16', 'IAS 36.12', 'ASC 842-10-15') explicitly mentioned or directly and significantly relevant within THIS SECTION's text. The number of codes should be dynamic, reflecting the section's content. Provide an empty list [] if none are applicable. These codes are crucial metadata for search reranking.
+    5.  **section_importance:** Assign a score between 0.0 (low importance) and 1.0 (high importance) representing how crucial this section's content is for understanding the overall topic of the chapter provided in the <overall_chapter_context>. Consider the section's scope and depth relative to the chapter summary. A score of 0.5 indicates average or unknown importance. Provide a float value (e.g., 0.7). This score will directly influence search result ranking.
     """)
     user_prompt_elements.append("</instructions>")
     user_prompt_elements.append("</prompt>")
@@ -526,10 +537,10 @@ def _build_section_prompt(section_text, chapter_summary, chapter_tags, previous_
         {"role": "user", "content": user_prompt}
     ]
     return messages
-
 def process_section(section_id, section_chunks, chapter_details, previous_section_summaries, client, model_name, max_completion_tokens, temperature):
     """Processes a single section using GPT, including context from previous sections."""
-    logging.info(f"Processing section: {section_id} with {len(previous_section_summaries)} previous summaries in context.")
+    # This log might be useful even with tqdm, but let's make it DEBUG for now to minimize output
+    logging.debug(f"Processing section: {section_id} with {len(previous_section_summaries)} previous summaries in context.")
 
     if not section_chunks:
         logging.warning(f"No chunks provided for section {section_id}. Skipping.")
@@ -538,7 +549,7 @@ def process_section(section_id, section_chunks, chapter_details, previous_sectio
     # Reconstruct section text (assuming chunks are sorted by 'order')
     section_text = "\n\n".join([chunk.get('content', '') for chunk in section_chunks])
     section_token_count = sum(chunk.get('chunk_token_count', 0) for chunk in section_chunks)
-    logging.info(f"Section '{section_id}' - Estimated tokens: {section_token_count}")
+    logging.debug(f"Section '{section_id}' - Estimated tokens: {section_token_count}") # Changed to DEBUG
 
     # Basic check - might need segmentation like chapters if sections get too large
     # TODO: Implement section segmentation if necessary, similar to get_chapter_level_details
@@ -555,7 +566,7 @@ def process_section(section_id, section_chunks, chapter_details, previous_sectio
     )
 
     prompt_tokens_est = sum(count_tokens(msg["content"]) for msg in messages)
-    logging.info(f"Estimated prompt tokens for section '{section_id}': {prompt_tokens_est}")
+    logging.debug(f"Estimated prompt tokens for section '{section_id}': {prompt_tokens_est}") # Changed to DEBUG
 
     try:
         response_content_json_str, usage_info = _call_gpt_with_retry(
@@ -570,7 +581,7 @@ def process_section(section_id, section_chunks, chapter_details, previous_sectio
 
         parsed_data = parse_gpt_json_response(
             response_content_json_str,
-            expected_keys=["section_summary", "section_tags", "section_standard", "section_standard_codes"]
+            expected_keys=["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance"]
         )
 
         if usage_info:
@@ -580,9 +591,10 @@ def process_section(section_id, section_chunks, chapter_details, previous_sectio
              prompt_cost = (prompt_tokens / 1000) * PROMPT_TOKEN_COST
              completion_cost = (completion_tokens / 1000) * COMPLETION_TOKEN_COST
              total_cost = prompt_cost + completion_cost
+             # Keep API usage info as INFO level for cost tracking, but maybe add a flag later?
              logging.info(f"API Usage (Section: {section_id}) - Prompt: {prompt_tokens}, Completion: {completion_tokens}, Total: {total_tokens}, Cost: ${total_cost:.4f}")
         else:
-             logging.info(f"Usage information not available for section {section_id}.")
+             logging.debug(f"Usage information not available for section {section_id}.") # Changed to DEBUG
 
         return parsed_data
 
@@ -670,11 +682,11 @@ def main():
                 section_order_map[section_id] = float('inf') # Should not happen if grouping is correct
 
         sorted_section_ids = sorted(sections_in_chapter_grouped.keys(), key=lambda sid: section_order_map[sid])
-        logging.info(f"Found {len(sorted_section_ids)} sections in chapter {chapter_num}. Processing in order.")
+        logging.info(f"Found {len(sorted_section_ids)} sections in chapter {chapter_num}. Processing...")
 
 
-        # 7. Iterate through sections in determined order
-        for section_id in sorted_section_ids:
+        # 7. Iterate through sections in determined order with tqdm progress bar
+        for section_id in tqdm(sorted_section_ids, desc=f"Chapter {chapter_num} Sections", unit="section"):
             section_chunks = sections_in_chapter_grouped[section_id]
 
             # Sanitize section_id for filename
@@ -688,22 +700,37 @@ def main():
             output_filename = f"chapter_{chapter_num}_section_{safe_section_id}_details.json"
             output_filepath = Path(SECTION_DETAILS_OUTPUT_DIR) / output_filename # Use Path() here for path joining
 
-            # 8. Check if output already exists (for resuming)
+            # 8. Check if output already exists and handle missing importance score
             if output_filepath.exists():
-                logging.info(f"Section details already exist for '{section_id}' (File: {output_filename}). Skipping generation.")
-                # OPTIONAL: Load the existing summary to add to context if needed for subsequent sections?
-                # try:
-                #     with open(output_filepath, 'r', encoding='utf-8') as f:
-                #         existing_data = json.load(f)
-                #     if 'section_summary' in existing_data:
-                #          # Add to recent_section_summaries without exceeding limit
-                #          recent_section_summaries.append(existing_data['section_summary'])
-                #          if len(recent_section_summaries) > MAX_RECENT_SUMMARIES:
-                #              recent_section_summaries.pop(0) # Remove oldest
-                # except Exception as e:
-                #     logging.warning(f"Could not load existing summary from {output_filename}: {e}")
-                skipped_sections += 1
-                continue
+                try:
+                    with open(output_filepath, 'r', encoding='utf-8') as f:
+                        existing_data = json.load(f)
+
+                    if 'section_importance' not in existing_data:
+                        logging.info(f"Existing file {output_filename} missing 'section_importance'. Adding default value 0.5.")
+                        existing_data['section_importance'] = 0.5
+                        # Overwrite the file with the added default importance
+                        with open(output_filepath, 'w', encoding='utf-8') as f:
+                            json.dump(existing_data, f, indent=4)
+                        logging.info(f"Updated {output_filename} with default importance.")
+                    else:
+                        logging.info(f"Section details already exist (with importance) for '{section_id}' (File: {output_filename}). Skipping generation.")
+
+                    # Optional: Load existing summary for context (keep this part if desired)
+                    if 'section_summary' in existing_data:
+                         # Add to recent_section_summaries without exceeding limit
+                         recent_section_summaries.append(existing_data['section_summary'])
+                         if len(recent_section_summaries) > MAX_RECENT_SUMMARIES:
+                             recent_section_summaries.pop(0) # Remove oldest
+
+                    skipped_sections += 1
+                    continue # Skip to the next section
+
+                except json.JSONDecodeError:
+                    logging.error(f"Error decoding existing JSON file {output_filename}. Will attempt to regenerate.")
+                except Exception as e:
+                    logging.warning(f"Error processing existing file {output_filename}: {e}. Will attempt to regenerate.")
+                    # Fall through to regenerate if reading/updating fails
 
             # 9. Prepare context (sliding window of previous summaries)
             context_summaries = recent_section_summaries[-MAX_RECENT_SUMMARIES:] # Get last N summaries
