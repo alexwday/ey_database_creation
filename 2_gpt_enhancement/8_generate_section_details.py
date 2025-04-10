@@ -337,7 +337,7 @@ def parse_gpt_json_response(response_content_str, expected_keys):
 def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
     """
     Loads all chunk JSONs from the input directory, validates required fields
-    ('order', 'chapter_number', 'content', 'chunk_token_count', section identifier),
+    ('order', 'chapter_number', 'content', 'chunk_token_count', 'orig_section_num'),
     sorts them by 'order', and groups them by 'chapter_number'.
     Returns a dictionary mapping chapter numbers to lists of chunk dicts.
     """
@@ -365,14 +365,9 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
                 data = json.load(f)
 
             # --- Validation ---
-            required_fields = ['order', 'chapter_number', 'content', 'chunk_token_count']
-            # Use 'section_hierarchy' first, fallback to 'section_title'
-            section_id_field = 'section_hierarchy' if 'section_hierarchy' in data else 'section_title'
-            if section_id_field not in data:
-                 logging.warning(f"Missing 'section_hierarchy' or 'section_title' in {filepath.name}. Skipping.")
-                 skipped_missing_field += 1
-                 continue
-            required_fields.append(section_id_field) # Add the found section identifier field
+            # Use 'orig_section_num' as the key identifier for the section before splitting.
+            required_fields = ['order', 'chapter_number', 'content', 'chunk_token_count', 'orig_section_num']
+            section_id_field = 'orig_section_num' # Use the original section number
 
             missing_fields = [field for field in required_fields if field not in data]
             if missing_fields:
@@ -380,15 +375,20 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
                 skipped_missing_field += 1
                 continue
 
+            # Validate types for key fields
             if not isinstance(data['order'], int):
                  logging.warning(f"Invalid 'order' field type in {filepath.name}. Skipping.")
                  skipped_missing_field += 1
                  continue
+            if not isinstance(data['orig_section_num'], int):
+                 logging.warning(f"Invalid 'orig_section_num' field type in {filepath.name}. Skipping.")
+                 skipped_missing_field += 1
+                 continue
             # --- End Validation ---
 
-            # Store which field was used for section ID for consistency later
-            data['_section_id_field'] = section_id_field
-            data['_section_id_value'] = data[section_id_field]
+            # Store the original section number as the identifier value
+            # Use a consistent internal key '_section_id_value' for the grouping logic later
+            data['_section_id_value'] = data[section_id_field] # Store the value of orig_section_num
 
             all_chunks_data.append(data)
             loaded_count += 1
@@ -459,19 +459,24 @@ def load_chapter_details(chapter_number, input_dir=CHAPTER_DETAILS_INPUT_DIR):
         return None
 
 def group_chunks_by_section(chapter_chunks):
-    """Groups chunks within a chapter by their section identifier."""
+    """Groups chunks within a chapter by their original section number."""
     grouped_by_section = defaultdict(list)
     if not chapter_chunks:
         return grouped_by_section
 
-    # Assume all chunks in the list use the same section ID field determined during loading
-    section_id_field = chapter_chunks[0].get('_section_id_field', 'section_hierarchy') # Default fallback
+    # Use the consistent internal key '_section_id_value' which holds the orig_section_num
+    section_id_key = '_section_id_value'
 
     for chunk in chapter_chunks:
-        section_id = chunk.get(section_id_field, 'Unknown Section')
-        grouped_by_section[section_id].append(chunk)
+        section_id = chunk.get(section_id_key) # Get the original section number
+        if section_id is not None:
+            grouped_by_section[section_id].append(chunk)
+        else:
+            # This should not happen if validation during loading is correct
+            logging.warning(f"Chunk missing '{section_id_key}' during grouping (Order: {chunk.get('order')}). Skipping.")
 
-    logging.debug(f"Grouped {len(chapter_chunks)} chunks into {len(grouped_by_section)} sections using field '{section_id_field}'.")
+
+    logging.debug(f"Grouped {len(chapter_chunks)} chunks into {len(grouped_by_section)} original sections using key '{section_id_key}' (orig_section_num).")
     return grouped_by_section
 
 
