@@ -29,7 +29,9 @@ from pathlib import Path
 import tiktoken # Ensure tiktoken is installed
 
 # --- Configuration ---
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Define BASE_DIR based on current working directory for notebook compatibility
+# Assumes the notebook is run from the project root (/Users/alexwday/Projects/ey_database_creation)
+BASE_DIR = Path.cwd()
 CHUNK_INPUT_DIR = BASE_DIR / "data" / "2E_final_merged_chunks"
 CHAPTER_DETAILS_INPUT_DIR = BASE_DIR / "data" / "3A_chapter_details"
 SECTION_DETAILS_OUTPUT_DIR = BASE_DIR / "data" / "3B_section_details"
