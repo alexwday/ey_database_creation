@@ -29,13 +29,10 @@ from pathlib import Path
 import tiktoken # Ensure tiktoken is installed
 
 # --- Configuration ---
-# Define BASE_DIR based on current working directory for notebook compatibility
-# Assumes the notebook is run from the project root (/Users/alexwday/Projects/ey_database_creation)
-BASE_DIR = Path.cwd()
-CHUNK_INPUT_DIR = BASE_DIR / "data" / "2E_final_merged_chunks"
-CHAPTER_DETAILS_INPUT_DIR = BASE_DIR / "data" / "3A_chapter_details"
-SECTION_DETAILS_OUTPUT_DIR = BASE_DIR / "data" / "3B_section_details"
-LOG_DIR = BASE_DIR / "logs"
+CHUNK_INPUT_DIR = "2E_final_merged_chunks" # Directory containing chunk JSONs
+CHAPTER_DETAILS_INPUT_DIR = "3A_chapter_details" # Directory containing chapter details JSONs
+SECTION_DETAILS_OUTPUT_DIR = "3B_section_details" # Directory to save section details JSONs
+LOG_DIR = "logs" # Directory for log files
 LOG_LEVEL = logging.INFO
 
 # --- Testing Configuration ---
@@ -82,7 +79,7 @@ SECTION_TOOL_SCHEMA = {
                 "section_tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "A list of 5-15 granular keywords or tags specific to this section's content."
+                    "description": "A list of meaningful keywords or tags specific to this section's content, scaled appropriately to the section's length and complexity. These tags will be used as metadata for search reranking."
                 },
                 "section_standard": {
                     "type": "string",
@@ -91,7 +88,7 @@ SECTION_TOOL_SCHEMA = {
                 "section_standard_codes": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "A list of specific standard codes explicitly mentioned or directly relevant in the section (e.g., ['IFRS 16', 'IAS 17'])."
+                    "description": "A list of specific standard codes explicitly mentioned or directly relevant in the section (e.g., ['IFRS 16', 'IAS 17']). The number of codes should reflect the section's content. These codes will be used as metadata for search reranking."
                 }
             },
             "required": ["section_summary", "section_tags", "section_standard", "section_standard_codes"]
@@ -100,8 +97,8 @@ SECTION_TOOL_SCHEMA = {
 }
 
 # --- Logging Setup ---
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-log_file = LOG_DIR / '8_generate_section_details.log'
+Path(LOG_DIR).mkdir(parents=True, exist_ok=True) # Use Path() here for mkdir
+log_file = Path(LOG_DIR) / '8_generate_section_details.log' # Use Path() here for path joining
 logging.basicConfig(
     level=LOG_LEVEL,
     format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
@@ -342,7 +339,7 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
     Returns a dictionary mapping chapter numbers to lists of chunk dicts.
     """
     all_chunks_data = []
-    input_path = Path(input_dir)
+    input_path = Path(input_dir) # Keep Path() here for directory operations
     logging.info(f"Loading chunks from: {input_path}")
 
     if not input_path.is_dir():
@@ -439,7 +436,7 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
 
 def load_chapter_details(chapter_number, input_dir=CHAPTER_DETAILS_INPUT_DIR):
     """Loads the pre-generated summary and tags for a specific chapter."""
-    details_path = Path(input_dir) / f"chapter_{chapter_number}_details.json"
+    details_path = Path(input_dir) / f"chapter_{chapter_number}_details.json" # Keep Path() here for path joining
     if not details_path.exists():
         logging.warning(f"Chapter details file not found for chapter {chapter_number} at {details_path}")
         return None
@@ -516,9 +513,9 @@ def _build_section_prompt(section_text, chapter_summary, chapter_tags, previous_
     **Analysis Objective:** Analyze the provided <current_section_text> considering the <overall_chapter_context> and <recent_section_context> (if provided).
     **Action:** Generate the following details for the **current section** using the 'extract_section_details' tool:
     1.  **section_summary:** A **very concise summary (1-3 sentences)** capturing the core topic or purpose of this section. This summary will be used to help rerank search results, so it should be distinct and informative at a glance.
-    2.  **section_tags:** 5-15 granular tags specific to THIS SECTION's content.
+    2.  **section_tags:** Generate a list of meaningful, granular tags specific to THIS SECTION's content. The number of tags should be dynamic and reflect the section's complexity and key topics. These tags are crucial metadata for search reranking.
     3.  **section_standard:** Identify the single, primary accounting standard framework most relevant to THIS SECTION (e.g., 'IFRS', 'US GAAP', 'N/A').
-    4.  **section_standard_codes:** List ALL specific standard codes (e.g., 'IFRS 16', 'IAS 36.12', 'ASC 842-10-15') explicitly mentioned within THIS SECTION's text. Provide an empty list [] if none are mentioned.
+    4.  **section_standard_codes:** List specific standard codes (e.g., 'IFRS 16', 'IAS 36.12', 'ASC 842-10-15') explicitly mentioned or directly and significantly relevant within THIS SECTION's text. The number of codes should be dynamic, reflecting the section's content. Provide an empty list [] if none are applicable. These codes are crucial metadata for search reranking.
     """)
     user_prompt_elements.append("</instructions>")
     user_prompt_elements.append("</prompt>")
@@ -598,7 +595,7 @@ def process_section(section_id, section_chunks, chapter_details, previous_sectio
 def main():
     """Main function to orchestrate section detail generation."""
     logging.info("Starting main execution...")
-    SECTION_DETAILS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    Path(SECTION_DETAILS_OUTPUT_DIR).mkdir(parents=True, exist_ok=True) # Use Path() here for mkdir
 
     # 1. Load and group all chunk data by chapter
     all_chapters_data = load_all_chunk_data_grouped(CHUNK_INPUT_DIR)
@@ -689,7 +686,7 @@ def main():
             if not safe_section_id:
                 safe_section_id = "unknown_section" # Fallback for empty IDs
             output_filename = f"chapter_{chapter_num}_section_{safe_section_id}_details.json"
-            output_filepath = SECTION_DETAILS_OUTPUT_DIR / output_filename
+            output_filepath = Path(SECTION_DETAILS_OUTPUT_DIR) / output_filename # Use Path() here for path joining
 
             # 8. Check if output already exists (for resuming)
             if output_filepath.exists():
