@@ -96,9 +96,14 @@ SECTION_TOOL_SCHEMA = {
                     "description": "A score between 0.0 (low importance) and 1.0 (high importance) indicating how crucial this section is to understanding the overall chapter's topic. A score of 0.5 indicates average or unknown importance. This float value will be used for search reranking.",
                     "minimum": 0.0,
                     "maximum": 1.0
+                },
+                "section_references": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "A list of explicit references to other sections, chapters, or standard codes found within this section's text (e.g., ['See Section 4.5', 'Refer to Chapter 3', 'IAS 36.12']). Provide an empty list [] if none are found. These references provide context."
                 }
             },
-            "required": ["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance"]
+            "required": ["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance", "section_references"]
         }
     }
 }
@@ -527,6 +532,7 @@ def _build_section_prompt(section_text, chapter_summary, chapter_tags, previous_
     3.  **section_standard:** Identify the single, primary accounting standard framework most relevant to THIS SECTION (e.g., 'IFRS', 'US GAAP', 'N/A').
     4.  **section_standard_codes:** List specific standard codes (e.g., 'IFRS 16', 'IAS 36.12', 'ASC 842-10-15') explicitly mentioned or directly and significantly relevant within THIS SECTION's text. The number of codes should be dynamic, reflecting the section's content. Provide an empty list [] if none are applicable. These codes are crucial metadata for search reranking.
     5.  **section_importance:** Assign a score between 0.0 (low importance) and 1.0 (high importance) representing how crucial this section's content is for understanding the overall topic of the chapter provided in the <overall_chapter_context>. Consider the section's scope and depth relative to the chapter summary. A score of 0.5 indicates average or unknown importance. Provide a float value (e.g., 0.7). This score will directly influence search result ranking.
+    6.  **section_references:** List any explicit textual references made within the <current_section_text> to other sections, chapters, paragraphs, or specific standard codes (e.g., "See Section 4.5", "Refer to Chapter 3", "IAS 36.12"). Provide an empty list [] if no explicit references are found.
     """)
     user_prompt_elements.append("</instructions>")
     user_prompt_elements.append("</prompt>")
@@ -581,7 +587,7 @@ def process_section(section_id, section_chunks, chapter_details, previous_sectio
 
         parsed_data = parse_gpt_json_response(
             response_content_json_str,
-            expected_keys=["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance"]
+            expected_keys=["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance", "section_references"]
         )
 
         if usage_info:
@@ -706,19 +712,32 @@ def main():
                     with open(output_filepath, 'r', encoding='utf-8') as f:
                         existing_data = json.load(f)
 
+                    needs_update = False
+                    update_log_messages = []
+
+                    # Check for missing importance score
                     if 'section_importance' not in existing_data:
-                        logging.info(f"Existing file {output_filename} missing 'section_importance'. Adding default value 0.5.")
+                        update_log_messages.append("missing 'section_importance'")
                         existing_data['section_importance'] = 0.5
-                        # Overwrite the file with the added default importance
+                        needs_update = True
+
+                    # Check for missing references field
+                    if 'section_references' not in existing_data:
+                        update_log_messages.append("missing 'section_references'")
+                        existing_data['section_references'] = []
+                        needs_update = True
+
+                    # Save if updates were made
+                    if needs_update:
+                        logging.info(f"Existing file {output_filename} {', '.join(update_log_messages)}. Adding default values.")
                         with open(output_filepath, 'w', encoding='utf-8') as f:
                             json.dump(existing_data, f, indent=4)
-                        logging.info(f"Updated {output_filename} with default importance.")
+                        logging.info(f"Updated {output_filename} with default values.")
                     else:
-                        logging.info(f"Section details already exist (with importance) for '{section_id}' (File: {output_filename}). Skipping generation.")
+                        logging.info(f"Section details already exist (with all fields) for '{section_id}' (File: {output_filename}). Skipping generation.")
 
-                    # Optional: Load existing summary for context (keep this part if desired)
+                    # Optional: Load existing summary for context
                     if 'section_summary' in existing_data:
-                         # Add to recent_section_summaries without exceeding limit
                          recent_section_summaries.append(existing_data['section_summary'])
                          if len(recent_section_summaries) > MAX_RECENT_SUMMARIES:
                              recent_section_summaries.pop(0) # Remove oldest
