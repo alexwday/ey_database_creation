@@ -212,6 +212,33 @@ def get_most_specific_heading(section_data: dict) -> str:
     return section_data.get("chapter_name", "Untitled_Section")
 
 
+# --- Helper Functions for Processing and Saving ---
+
+def find_original_md(filename: str, md_dir: str) -> str | None:
+    """
+    Constructs the full path to an original markdown file and checks existence.
+
+    Args:
+        filename: The base name of the markdown file (e.g., "Chapter_1.md").
+        md_dir: The directory where the original markdown files are stored.
+
+    Returns:
+        The full path if the file exists, otherwise None.
+    """
+    if not filename or not md_dir:
+        return None
+    full_path = os.path.join(md_dir, filename)
+    if os.path.isfile(full_path):
+        return full_path
+    else:
+        # Attempt fallback: Check if filename already contains the directory prefix
+        # (e.g., if source_markdown_file was accidentally saved with the path)
+        if os.path.isfile(filename):
+             print(f"  WARN: Found original MD file using the provided name '{filename}' directly, which might indicate an unexpected format for 'source_markdown_file'.")
+             return filename
+        return None
+
+
 # --- Core Splitting Logic ---
 
 
