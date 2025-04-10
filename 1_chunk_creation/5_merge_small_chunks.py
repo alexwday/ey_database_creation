@@ -331,10 +331,7 @@ def merge_final_small_chunks(
         # Always advance the loop counter
         i += 1
 
-    # Remove temporary internal filename key before returning
-    for chunk in final_chunks_list:
-        chunk.pop("_filename", None)
-
+    # Return the list including the _filename key, it will be removed before saving
     return final_chunks_list
 
 
@@ -424,24 +421,11 @@ def main():
 
     # 3. Save the potentially modified chunks
     # 3. Save the potentially modified chunks
-    # The `merge_final_small_chunks` function removes the internal '_filename' key.
-    # However, the `save_chunks` function currently relies on this key to determine
-    # the output filename. We re-add the '_filename' key here before saving.
-    # NOTE: This filename regeneration based on final index might not perfectly
-    # match the original filenames if merges occurred across different original
-    # section indices. A more robust approach might involve preserving or
-    # updating the filename during the merge process itself.
+    # 4. Add the final 'order' field based on the sorted list
     for i, chunk in enumerate(final_chunks):
-        # Attempt to regenerate a filename based on available chunk data.
-        # Using a simple index-based name as a fallback.
-        chap_num = chunk.get("chapter_number", 0)
-        # Using the loop index `i` provides a unique sequence number for the final chunks.
-        final_index = i + 1
-        # We don't have original section/part index readily available after merges,
-        # so we use the final index for uniqueness.
-        chunk["_filename"] = f"{chap_num:03d}_final_{final_index:04d}.json"
+        chunk["order"] = i + 1 # Add 1-based order field
 
-    # Save the final chunks using the regenerated filenames.
+    # 5. Save the final chunks using their original filenames (preserved in _filename)
     save_chunks(final_chunks, output_dir)
 
     print("-" * 50)

@@ -466,8 +466,19 @@ def split_large_section_content(cleaned_content, max_tokens=MAX_TOKENS):
 
 
 # --- Helper Functions for Processing and Saving ---
-# Note: _generate_output_filename and _handle_section* functions are removed
-# as they are replaced by the logic within the new process_paged_section_json
+
+def get_most_specific_heading(section_data: dict) -> str:
+    """
+    Retrieves the most specific heading text for a section.
+    (Copied from Stage 2 for consistency - consider refactoring)
+    """
+    current_level = section_data.get("level", 0)
+    for level_num in range(current_level, 0, -1):
+        level_key = f"level_{level_num}"
+        heading_text = section_data.get(level_key)
+        if heading_text:
+            return heading_text
+    return section_data.get("chapter_name", "Untitled_Section")
 
 
 def process_paged_section_json(section_json_path, original_md_dir, output_dir):
@@ -488,31 +499,38 @@ def process_paged_section_json(section_json_path, original_md_dir, output_dir):
         original_raw_start = section_data.get('start_pos')
         original_raw_end = section_data.get('end_pos') # Needed for tag filtering
         source_md_filename = section_data.get('source_markdown_file')
+        chapter_number = section_data.get('chapter_number')
+        orig_section_num = section_data.get('orig_section_num') # Added in Stage 2
+
+        # --- Validate necessary data ---
+        if chapter_number is None or orig_section_num is None:
+            print(f"  ERROR: Missing 'chapter_number' or 'orig_section_num' in {input_filename}. Skipping.")
+            return 0
+
+        # Get section name for filename
+        section_header = get_most_specific_heading(section_data)
+        clean_section_name = cleanup_filename(section_header)
+        if not clean_section_name: # Fallback if cleaning results in empty
+            clean_section_name = f"Section{section_data.get('level', 0)}"
 
         # --- Check if splitting is needed ---
         if original_token_count <= MAX_TOKENS:
             # No splitting needed, just format and save
             print(f"  Section token count ({original_token_count}) is within limit. Saving as single chunk.")
             final_chunk_data = section_data.copy()
-            final_chunk_data['chunk_part_number'] = 0  # Not split
+
+            # Add new schema fields
+            final_chunk_data['part_number'] = "1/1"
+            final_chunk_data['token_ratio'] = f"{original_token_count}/{original_token_count}"
             # Add chunk_token_count for consistency, even if same as original
             final_chunk_data['chunk_token_count'] = original_token_count
-            final_chunk_data.pop('token_count', None) # Remove original key
 
-            # Find a clean filename: chX_secY_name_part000.json
-            match = re.match(r'(\d+)_(\d+)_(.+)\.json', input_filename)
-            if match:
-                chap_num_str, sec_idx_str, base_name = match.groups()
-                # Clean base name similar to original script's helper
-                clean_base_name = cleanup_filename(base_name)
-                # Use user's preferred format _partXXX.json
-                output_filename = f"{chap_num_str}_{sec_idx_str}_{clean_base_name}_part000.json"
-            else:
-                # Fallback filename if pattern doesn't match
-                base = os.path.splitext(input_filename)[0]
-                clean_base = cleanup_filename(base)
-                output_filename = f"{clean_base}_part000.json"
+            # Remove original token_count and old part number if present
+            final_chunk_data.pop('token_count', None)
+            final_chunk_data.pop('chunk_part_number', None) # Remove old field if exists
 
+            # Construct filename: 00x(chapter)_00x(orig_section_num)_section_name_001.json
+            output_filename = f"{chapter_number:03d}_{orig_section_num:03d}_{clean_section_name}_001.json"
             output_filepath = os.path.join(output_dir, output_filename)
 
             # Save the single chunk
@@ -528,7 +546,7 @@ def process_paged_section_json(section_json_path, original_md_dir, output_dir):
             # --- Splitting is needed ---
             print(f"  Section token count ({original_token_count}) exceeds limit ({MAX_TOKENS}). Splitting...")
 
-            # Use original script's checks for necessary data
+            # Check for necessary data for splitting
             if original_raw_start is None or original_raw_end is None or not source_md_filename:
                 print(f"  ERROR: Missing 'start_pos', 'end_pos', or 'source_markdown_file' needed for splitting. Skipping {input_filename}.")
                 return 0 # Return 0 chunks saved
@@ -558,60 +576,48 @@ def process_paged_section_json(section_json_path, original_md_dir, output_dir):
             split_sub_chunks = split_large_section_content(cleaned_content, MAX_TOKENS)
             print(f"  Split into {len(split_sub_chunks)} potential sub-chunks.")
 
-            # Deduplicate and save
+            # --- Deduplicate and Prepare Unique Chunks ---
+            unique_chunks_to_save = []
             seen_content_hashes = set()
-            split_part_index = 0  # Start part numbering from 1
-
             for sub_chunk in split_sub_chunks:
-                # Calculate content hash for deduplication
                 content_hash = hashlib.md5(sub_chunk['content'].encode('utf-8')).hexdigest()
-
-                if content_hash in seen_content_hashes:
+                if content_hash not in seen_content_hashes:
+                    seen_content_hashes.add(content_hash)
+                    unique_chunks_to_save.append(sub_chunk)
+                else:
                     print(f"    Skipping duplicate content chunk (hash: {content_hash[:8]}...)")
-                    continue
 
-                seen_content_hashes.add(content_hash)
-                split_part_index += 1  # Increment part number for unique chunks
+            total_unique_parts = len(unique_chunks_to_save)
+            print(f"  Processing {total_unique_parts} unique sub-chunks.")
 
-                # Map clean positions back to raw positions using helper from original script
-                chunk_raw_start = map_clean_to_raw_pos(sub_chunk['clean_start_pos'], original_raw_start, section_tag_mapping)
-                chunk_raw_end = map_clean_to_raw_pos(sub_chunk['clean_end_pos'], original_raw_start, section_tag_mapping)
+            # --- Save Unique Chunks ---
+            current_part_index = 0
+            for chunk in unique_chunks_to_save:
+                current_part_index += 1 # Part numbers are 1-based
+
+                # Map clean positions back to raw positions
+                chunk_raw_start = map_clean_to_raw_pos(chunk['clean_start_pos'], original_raw_start, section_tag_mapping)
+                chunk_raw_end = map_clean_to_raw_pos(chunk['clean_end_pos'], original_raw_start, section_tag_mapping)
 
                 # Create the final chunk data
                 final_chunk_data = section_data.copy()  # Start with original section metadata
-                final_chunk_data['content'] = sub_chunk['content']
-                final_chunk_data['chunk_token_count'] = sub_chunk['token_count']
-                final_chunk_data['chunk_part_number'] = split_part_index
+                final_chunk_data['content'] = chunk['content']
+                final_chunk_data['chunk_token_count'] = chunk['token_count']
                 final_chunk_data['start_pos'] = chunk_raw_start  # Update raw positions
                 final_chunk_data['end_pos'] = chunk_raw_end
 
-                # Add (Part X) to the most specific heading using helper from original script
-                heading_key = f"level_{final_chunk_data.get('level', 0)}"
-                if heading_key in final_chunk_data:
-                     heading_text = final_chunk_data[heading_key]
-                     # Avoid adding suffix multiple times if script is rerun
-                     if not re.search(r" \(Part \d+\)$", heading_text):
-                         final_chunk_data[heading_key] = f"{heading_text} (Part {split_part_index})"
+                # Add new schema fields
+                final_chunk_data['part_number'] = f"{current_part_index}/{total_unique_parts}"
+                final_chunk_data['token_ratio'] = f"{chunk['token_count']}/{original_token_count}"
 
-                # Remove original token_count
+                # Remove original token_count and old part number if present
                 final_chunk_data.pop('token_count', None)
+                final_chunk_data.pop('chunk_part_number', None) # Remove old field if exists
 
-                # Construct filename using user's preferred format _partXXX.json
-                match = re.match(r'(\d+)_(\d+)_(.+)\.json', input_filename)
-                if match:
-                    chap_num_str, sec_idx_str, base_name = match.groups()
-                    # Clean base name
-                    clean_base_name = cleanup_filename(base_name)
-                    # Remove potential existing suffix before adding new one
-                    clean_base_name = re.sub(r"(_part|_Part|_)\d+$", "", clean_base_name)
-                    output_filename = f"{chap_num_str}_{sec_idx_str}_{clean_base_name}_part{split_part_index:03d}.json"
-                else:
-                    # Fallback filename if pattern doesn't match
-                    base = os.path.splitext(input_filename)[0]
-                    clean_base = cleanup_filename(base)
-                    clean_base = re.sub(r"(_part|_Part|_)\d+$", "", clean_base) # Clean suffix here too
-                    output_filename = f"{clean_base}_part{split_part_index:03d}.json"
+                # Keep original headings clean (do not add "(Part X)")
 
+                # Construct filename: 00x(chapter)_00x(orig_section_num)_section_name_00x(part).json
+                output_filename = f"{chapter_number:03d}_{orig_section_num:03d}_{clean_section_name}_{current_part_index:03d}.json"
                 output_filepath = os.path.join(output_dir, output_filename)
 
                 # Save the chunk

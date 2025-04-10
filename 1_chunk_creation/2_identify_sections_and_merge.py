@@ -202,7 +202,7 @@ def split_chapter_into_sections(
                 "level_1": chapter_name,  # Use chapter name as level 1 heading
                 "start_pos": 0,
                 "end_pos": len(raw_content),
-                "_position": 0,  # Internal tracking index
+                "orig_section_num": 0,  # Original section index within chapter
             }
         ]
 
@@ -249,7 +249,7 @@ def split_chapter_into_sections(
                 "level": current_level if current_level > 0 else 1,
                 "start_pos": section_start_pos,
                 "end_pos": section_end_pos,
-                "_position": section_index_in_chapter,  # Internal tracking
+                "orig_section_num": section_index_in_chapter,  # Original section index within chapter
             }
             # Add the current heading context (level_1 to level_6)
             for level_num in range(1, 7):
@@ -546,9 +546,9 @@ def process_chapter_json(chapter_json_path: str, output_dir: str) -> int:
         for section_data in merged_sections:
             section_output_index += 1
 
-            # Prepare data for saving (remove internal keys)
+            # Prepare data for saving
             save_data = section_data.copy()
-            save_data.pop("_position", None)  # Remove internal position tracker
+            # Keep 'orig_section_num' in the output JSON
 
             # Determine filename based on most specific heading
             heading_for_filename = get_most_specific_heading(save_data)
