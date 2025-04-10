@@ -241,31 +241,21 @@ def find_original_md(filename: str, md_dir: str) -> str | None:
 
 # --- Core Splitting Logic ---
 
+def split_paragraph_by_sentences(paragraph, max_tokens=MAX_TOKENS):
+    """Split a large paragraph (cleaned text) into smaller chunks of roughly even size."""
+    # Pattern to match sentences by whitespace or newline, uses positive lookahead
+    # to avoid dropping sentence terminators
+    # sentence_pattern = re.compile(r'[^.!?]+[.!?]') # Original attempt - might miss things
+    sentence_pattern = re.compile(r'(?<=[.!?])(?:\s+|\n+)') # Lookbehind for terminator
 
-def split_paragraph_by_sentences(paragraph: str, max_tokens: int) -> list[str]:
-    """
-    Splits a single paragraph string into smaller chunks based on sentence
-    boundaries, ensuring no chunk exceeds `max_tokens`. If a single sentence
-    exceeds `max_tokens`, it's split by words.
-
-    Args:
-        paragraph: The text of the paragraph (assumed cleaned).
-        max_tokens: The maximum token limit for each resulting chunk.
-
-    Returns:
-        A list of strings, where each string is a chunk of the original
-        paragraph, respecting sentence boundaries where possible.
-    """
-    # Simple sentence splitting based on common terminators followed by space/newline.
-    # This might not be perfect for all edge cases (e.g., abbreviations).
-    sentence_pattern = re.compile(
-        r"(?<=[.!?])(?:\s+|\n+)"
-    )  # Positive lookbehind for terminator
+    # Split text into potential sentences
     sentences = sentence_pattern.split(paragraph)
-    # Filter out empty strings that can result from splitting
+    # Filter out any empty strings that might result from the split
     sentences = [s.strip() for s in sentences if s and s.strip()]
 
-    if not sentences:  # Handle empty or whitespace-only paragraphs
+    if not sentences:
+        # If splitting results in nothing, return the original paragraph as one chunk
+        # This might happen if the paragraph has no standard sentence terminators
         return [paragraph] if paragraph.strip() else []
 
     chunks = []
@@ -275,424 +265,372 @@ def split_paragraph_by_sentences(paragraph: str, max_tokens: int) -> list[str]:
     for sentence in sentences:
         sentence_tokens = count_tokens(sentence)
 
-        # --- Handle sentences that are themselves too long ---
+        # --- Handle oversized sentences ---
         if sentence_tokens > max_tokens:
-            # If there's a pending chunk, save it first
+            # 1. Finalize the chunk accumulated *before* this oversized sentence
             if current_chunk_sentences:
-                chunks.append(" ".join(current_chunk_sentences))
+                chunks.append(' '.join(current_chunk_sentences))
                 current_chunk_sentences = []
                 current_tokens = 0
 
-            # Split the oversized sentence by words
+            # 2. Split the long sentence itself by words (arbitrary split)
             words = sentence.split()
-            temp_word_chunk = []
-            temp_word_tokens = 0
+            temp_chunk = []
+            temp_tokens = 0
             for word in words:
                 # Estimate token count for word + space
-                word_token_estimate = count_tokens(word + " ")
-                # If adding the word exceeds limit, finalize the temp word chunk
-                if (
-                    temp_word_tokens > 0
-                    and temp_word_tokens + word_token_estimate > max_tokens
-                ):
-                    chunks.append(" ".join(temp_word_chunk))
-                    temp_word_chunk = [word]
-                    temp_word_tokens = word_token_estimate
-                else:
-                    temp_word_chunk.append(word)
-                    temp_word_tokens += word_token_estimate
-            # Add any remaining words in the temp chunk
-            if temp_word_chunk:
-                chunks.append(" ".join(temp_word_chunk))
+                word_tokens = count_tokens(word + ' ')
 
-            # Reset for the next sentence (current oversized one is fully processed)
+                if temp_tokens > 0 and temp_tokens + word_tokens > max_tokens:
+                    # This word pushes over the limit, finalize previous temp chunk
+                    chunks.append(' '.join(temp_chunk))
+                    temp_chunk = [word]
+                    temp_tokens = word_tokens
+                else:
+                    temp_chunk.append(word)
+                    temp_tokens += word_tokens
+
+            # Add any remaining words in the temp chunk
+            if temp_chunk:
+                chunks.append(' '.join(temp_chunk))
+
+            # Reset current chunk tracking after handling the oversized sentence
             current_chunk_sentences = []
             current_tokens = 0
-            continue  # Move to the next sentence
+            continue # Move to the next sentence
 
         # --- Handle normal sentences ---
-        # If adding the current sentence would exceed max_tokens, finalize the current chunk
-        if current_tokens > 0 and current_tokens + sentence_tokens > max_tokens:
-            chunks.append(" ".join(current_chunk_sentences))
-            # Start a new chunk with the current sentence
+        # If adding this sentence would exceed max tokens and we already have content
+        elif current_tokens > 0 and current_tokens + sentence_tokens > max_tokens:
+            # Finalize current chunk
+            chunks.append(' '.join(current_chunk_sentences))
+            # Start a new chunk with this sentence
             current_chunk_sentences = [sentence]
             current_tokens = sentence_tokens
         else:
-            # Add the sentence to the current chunk
+            # Add sentence to the current chunk
             current_chunk_sentences.append(sentence)
             current_tokens += sentence_tokens
 
-    # Add any remaining sentences in the last chunk
+    # Add the final accumulated chunk if any sentences are left
     if current_chunk_sentences:
-        chunks.append(" ".join(current_chunk_sentences))
+        chunks.append(' '.join(current_chunk_sentences))
 
-    # Filter out any potentially empty chunks created during processing
+    # Ensure no empty chunks are returned
     return [c for c in chunks if c]
 
-
-def split_large_section_content(cleaned_content: str, max_tokens: int) -> list[dict]:
+def split_large_section_content(cleaned_content, max_tokens=MAX_TOKENS):
     """
-    Splits the cleaned content of a large section into smaller sub-chunks.
-
-    Prioritizes splitting by paragraph breaks (`\\n\\s*\\n+`). If a paragraph
-    itself exceeds `max_tokens`, it's further split by sentences using
-    `split_paragraph_by_sentences`.
-
-    Args:
-        cleaned_content: The cleaned text content of the section to be split.
-        max_tokens: The maximum token limit for any resulting sub-chunk.
-
-    Returns:
-        A list of dictionaries, where each dictionary represents a sub-chunk
-        and contains:
-        - 'content': The text content of the sub-chunk.
-        - 'clean_start_pos': Start position relative to the input `cleaned_content`.
-        - 'clean_end_pos': End position relative to the input `cleaned_content`.
-        - 'token_count': Token count of the sub-chunk's content.
+    Splits the cleaned content of a large section into smaller sub-chunks using
+    the greedy paragraph and sentence combination strategy.
     """
-    # Split content by double (or more) newlines to get paragraphs
-    para_pattern = re.compile(r"\n\s*\n+")  # Matches one or more blank lines
-    paragraphs = para_pattern.split(cleaned_content)
+    # Find paragraph boundaries in the cleaned content
+    para_pattern = re.compile(r'\n\s*\n+') # Use original script's pattern
+    para_matches = list(para_pattern.finditer(cleaned_content))
 
-    split_sub_chunks = (
-        []
-    )  # Stores the final list of {'content', 'clean_start_pos', ...} dicts
-    current_clean_pos = 0  # Track position within the *cleaned_content*
+    # Get end positions of paragraph separators (start of next paragraph)
+    para_boundaries = [m.end() for m in para_matches]
 
-    for para_text in paragraphs:
-        para_text_stripped = para_text.strip()
-        if not para_text_stripped:
-            # Advance position past the paragraph break itself
-            match = para_pattern.search(cleaned_content, current_clean_pos)
-            if match:
-                current_clean_pos = match.end()
-            continue  # Skip empty paragraphs
+    # Define paragraph start/end positions
+    split_sub_chunks = []
+
+    current_chunk_paras_clean_text = []
+    current_chunk_clean_start_pos = 0 # Relative to cleaned_content start
+    current_chunk_tokens = 0
+
+    # Iterate through paragraphs defined by boundaries
+    for i in range(len(para_boundaries) + 1):
+        # Determine the start and end of the current paragraph slice
+        para_slice_start = para_boundaries[i-1] if i > 0 else 0
+        para_slice_end = para_boundaries[i] if i < len(para_boundaries) else len(cleaned_content)
+
+        # Extract the paragraph text itself (including internal whitespace)
+        para_text_raw = cleaned_content[para_slice_start:para_slice_end]
+        para_text_stripped = para_text_raw.strip() # For token counting and content storage
+
+        if not para_text_stripped:  # Skip effectively empty paragraphs
+            continue
 
         para_tokens = count_tokens(para_text_stripped)
-        para_clean_start_pos = cleaned_content.find(para_text, current_clean_pos)
-        if para_clean_start_pos == -1:  # Should not happen if logic is correct
-            print(
-                f"WARN: Could not find paragraph start pos. Content:\n{para_text[:100]}..."
-            )
-            para_clean_start_pos = current_clean_pos  # Best guess
 
-        # --- Handle paragraphs exceeding max_tokens ---
+        # Find the actual start position of the stripped text within the raw slice
+        # This is needed for accurate clean_start_pos calculation
+        try:
+            strip_offset = para_text_raw.index(para_text_stripped)
+            para_clean_start_in_section = para_slice_start + strip_offset
+        except ValueError:
+             # Should not happen if para_text_stripped is not empty
+             para_clean_start_in_section = para_slice_start
+
+
+        # --- Handle oversized paragraphs by splitting them first ---
         if para_tokens > max_tokens:
-            # Split the oversized paragraph by sentences
-            sentence_chunks = split_paragraph_by_sentences(
-                para_text_stripped, max_tokens
-            )
-            current_sentence_offset = 0
-            for sentence_chunk in sentence_chunks:
-                sentence_tokens = count_tokens(sentence_chunk)
-                # Calculate start/end relative to the *original cleaned_content*
-                chunk_clean_start = para_clean_start_pos + current_sentence_offset
-                chunk_clean_end = chunk_clean_start + len(sentence_chunk)
-                split_sub_chunks.append(
-                    {
-                        "content": sentence_chunk,
-                        "clean_start_pos": chunk_clean_start,
-                        "clean_end_pos": chunk_clean_end,
-                        "token_count": sentence_tokens,
-                    }
-                )
-                # Update offset for the next sentence chunk within this paragraph
-                # Need to find the actual start of the next part in the original para_text
-                # This is tricky if sentences were split/rejoined. Approximate by length.
-                current_sentence_offset += len(sentence_chunk)
-                # Add 1 or more for the space/newline delimiter that was likely removed
-                # This isn't perfect but helps keep positions somewhat aligned.
-                while (
-                    current_sentence_offset < len(para_text)
-                    and para_text[current_sentence_offset].isspace()
-                ):
-                    current_sentence_offset += 1
+            # 1. Finalize the chunk accumulated *before* this oversized paragraph
+            if current_chunk_paras_clean_text:
+                chunk_clean_text = '\n\n'.join(current_chunk_paras_clean_text)
+                # End position is where the oversized paragraph's raw slice started
+                chunk_clean_end_pos = para_slice_start
+                split_sub_chunks.append({
+                    'content': chunk_clean_text,
+                    'clean_start_pos': current_chunk_clean_start_pos,
+                    'clean_end_pos': chunk_clean_end_pos,
+                    'token_count': current_chunk_tokens
+                })
+                # Reset tracking for the chunks coming from the split paragraph
+                current_chunk_paras_clean_text = []
+                current_chunk_tokens = 0
 
-        # --- Handle paragraphs within the token limit ---
+            # 2. Split the oversized paragraph itself by sentences
+            sentence_chunks_text = split_paragraph_by_sentences(para_text_stripped, max_tokens)
+            current_sentence_offset_in_para = 0 # Track position within the stripped paragraph
+
+            for sentence_chunk_text in sentence_chunks_text:
+                sentence_chunk_tokens = count_tokens(sentence_chunk_text)
+                # Calculate start/end relative to the *section*'s cleaned_content start
+                # Start is the paragraph's clean start + offset within the stripped para
+                chunk_clean_start = para_clean_start_in_section + current_sentence_offset_in_para
+                chunk_clean_end = chunk_clean_start + len(sentence_chunk_text) # Approx end
+
+                split_sub_chunks.append({
+                    'content': sentence_chunk_text,
+                    'clean_start_pos': chunk_clean_start,
+                    'clean_end_pos': chunk_clean_end, # Note: This end pos might be slightly off due to sentence joining spaces
+                    'token_count': sentence_chunk_tokens
+                })
+
+                # Update start offset for next sentence chunk within the paragraph
+                # Find where the next sentence actually starts in the stripped paragraph text
+                try:
+                    # Search *after* the current sentence chunk's text
+                    next_start_in_para = para_text_stripped.index(
+                        sentence_chunk_text, current_sentence_offset_in_para
+                        ) + len(sentence_chunk_text)
+                    # Skip potential whitespace between sentences
+                    while next_start_in_para < len(para_text_stripped) and para_text_stripped[next_start_in_para].isspace():
+                        next_start_in_para += 1
+                    current_sentence_offset_in_para = next_start_in_para
+                except ValueError:
+                    # If not found (e.g., last sentence), break or set to end
+                    current_sentence_offset_in_para = len(para_text_stripped)
+
+
+            # After splitting the oversized paragraph, the next chunk will start
+            # at the beginning of the *next* paragraph's slice.
+            # Set the start position for a potential *new* chunk starting after this split one.
+            current_chunk_clean_start_pos = para_slice_end # Start next chunk after the para break
+            current_chunk_paras_clean_text = [] # Ensure reset
+            current_chunk_tokens = 0 # Ensure reset
+            continue  # Move to the next paragraph in the outer loop
+
+        # --- Handle normal paragraphs (not oversized themselves) ---
+        # Check if adding this paragraph exceeds max tokens
+        if current_chunk_tokens > 0 and current_chunk_tokens + para_tokens > max_tokens:
+            # Finalize the current chunk *before* adding this paragraph
+            chunk_clean_text = '\n\n'.join(current_chunk_paras_clean_text)
+            # End position is where this paragraph's raw slice started
+            chunk_clean_end_pos = para_slice_start
+
+            split_sub_chunks.append({
+                'content': chunk_clean_text,
+                'clean_start_pos': current_chunk_clean_start_pos,
+                'clean_end_pos': chunk_clean_end_pos,
+                'token_count': current_chunk_tokens
+            })
+
+            # Start a new chunk with the current paragraph
+            current_chunk_paras_clean_text = [para_text_stripped]
+            current_chunk_tokens = para_tokens
+            current_chunk_clean_start_pos = para_clean_start_in_section # Use actual text start
         else:
-            chunk_clean_start = para_clean_start_pos
-            chunk_clean_end = chunk_clean_start + len(
-                para_text
-            )  # Use original length before strip
-            split_sub_chunks.append(
-                {
-                    "content": para_text_stripped,  # Store stripped version
-                    "clean_start_pos": chunk_clean_start,
-                    "clean_end_pos": chunk_clean_end,
-                    "token_count": para_tokens,
-                }
-            )
+            # Add paragraph to the current chunk
+            # If this is the first paragraph of a new chunk, set its start position
+            if not current_chunk_paras_clean_text:
+                current_chunk_clean_start_pos = para_clean_start_in_section
+            current_chunk_paras_clean_text.append(para_text_stripped)
+            current_chunk_tokens += para_tokens
 
-        # Update current_clean_pos for the next paragraph search
-        current_clean_pos = para_clean_start_pos + len(para_text)
-        # Advance past potential paragraph break characters
-        match = para_pattern.search(cleaned_content, current_clean_pos)
-        if match and match.start() == current_clean_pos:
-            current_clean_pos = match.end()
+    # Add the final accumulated chunk after the loop finishes
+    if current_chunk_paras_clean_text:
+        chunk_clean_text = '\n\n'.join(current_chunk_paras_clean_text)
+        # End position is the end of the original cleaned content
+        chunk_clean_end_pos = len(cleaned_content)
 
-    # --- Combine adjacent small chunks resulting from splitting ---
-    # This logic might be better placed within the paragraph/sentence splitting,
-    # but doing it here ensures chunks are reasonably sized after initial splits.
-    # Re-using the merge logic from Stage 2 might be complex due to position tracking.
-    # For now, we return the potentially numerous small chunks from sentence splitting.
-    # A simpler combination pass could be added if needed.
+        split_sub_chunks.append({
+            'content': chunk_clean_text,
+            'clean_start_pos': current_chunk_clean_start_pos,
+            'clean_end_pos': chunk_clean_end_pos,
+            'token_count': current_chunk_tokens
+        })
 
     return split_sub_chunks
 
 
 # --- Helper Functions for Processing and Saving ---
+# Note: _generate_output_filename and _handle_section* functions are removed
+# as they are replaced by the logic within the new process_paged_section_json
 
 
-def _generate_output_filename(input_filename: str, part_index: int) -> str:
-    """
-    Generates the output filename for a final chunk based on the input
-    section filename and the part index (0 for unsplit, 1+ for split parts).
-
-    Example: 001_005_Some_Heading.json -> 001_005_Some_Heading_001.json
-    """
-    # Try to parse the input filename (e.g., "001_005_Some_Heading.json")
-    match = re.match(r"(\d+)_(\d+)_(.+)\.json", input_filename)
-    if match:
-        chap_num_str, sec_idx_str, base_name = match.groups()
-        # Remove potential existing "_PartX" or "_00X" suffix from base_name if script was rerun
-        base_name = re.sub(r"(_part|_Part|_)\d+$", "", base_name)
-        # Ensure the base name is filesystem-safe
-        clean_base_name = cleanup_filename(base_name)
-        # Format: ChapterNum_SectionIndex_CleanBaseName_PartIndex.json
-        return f"{chap_num_str}_{sec_idx_str}_{clean_base_name}_{part_index:03d}.json"
-    else:
-        # Fallback if the input filename format is unexpected
-        base = os.path.splitext(input_filename)[0]
-        base = re.sub(r"(_part|_Part|_)\d+$", "", base)  # Clean potential old suffix
-        clean_base = cleanup_filename(base)
-        return f"{clean_base}_{part_index:03d}.json"
-
-
-def _handle_section_within_limit(
-    section_data: dict, input_filename: str, output_dir: str
-) -> int:
-    """
-    Saves a section that is within the token limit as a single chunk (Part 0).
-
-    Args:
-        section_data: The data dictionary for the section.
-        input_filename: The original filename of the section JSON.
-        output_dir: The directory to save the final chunk JSON.
-
-    Returns:
-        1 if saved successfully, 0 otherwise.
-    """
-    original_token_count = section_data.get(
-        "token_count", 0
-    )  # Get original count before potential pop
-    print(
-        f"  Section token count ({original_token_count}) is within limit. Saving as single chunk."
-    )
-
-    # Prepare final chunk data
-    final_chunk_data = section_data.copy()
-    final_chunk_data["chunk_token_count"] = (
-        original_token_count  # Add specific chunk token count
-    )
-    final_chunk_data["chunk_part_number"] = 0  # Indicate it's the only part
-    final_chunk_data.pop(
-        "token_count", None
-    )  # Remove the original section token count key
-
-    # Generate output filename (Part 0)
-    output_filename = _generate_output_filename(input_filename, part_index=0)
-    output_filepath = os.path.join(output_dir, output_filename)
-
-    # Save the chunk
-    try:
-        with open(output_filepath, "w", encoding="utf-8") as f:
-            json.dump(final_chunk_data, f, indent=2, ensure_ascii=False)
-        return 1  # Saved 1 chunk
-    except Exception as e:
-        print(f"  ERROR saving chunk {output_filename}: {e}")
-        return 0
-
-
-def _handle_section_needs_splitting(
-    section_data: dict, input_filename: str, original_md_dir: str, output_dir: str
-) -> int:
-    """
-    Handles splitting a section that exceeds MAX_TOKENS. Splits content, maps
-    positions, deduplicates, updates metadata, and saves unique sub-chunks.
-
-    Args:
-        section_data: Data dictionary of the large section.
-        input_filename: Original filename of the section JSON.
-        original_md_dir: Directory containing original markdown files.
-        output_dir: Directory to save the final chunk JSON files.
-
-    Returns:
-        The number of unique chunks saved after splitting.
-    """
-    original_token_count = section_data.get(
-        "token_count", 0
-    )  # Original count of the whole section
-    cleaned_content = section_data.get(
-        "content", ""
-    )  # Cleaned content of the whole section
-    section_raw_start = section_data.get("start_pos")  # Start pos in original raw MD
-    section_raw_end = section_data.get("end_pos")  # End pos in original raw MD
-    source_md_filename = section_data.get("source_markdown_file")
+def process_paged_section_json(section_json_path, original_md_dir, output_dir):
+    """Processes a single paged section JSON using the user-provided logic."""
     saved_chunk_count = 0
+    input_filename = os.path.basename(section_json_path) # Moved up for logging
 
-    print(
-        f"  Section token count ({original_token_count}) exceeds limit ({MAX_TOKENS}). Splitting..."
-    )
-
-    # --- Pre-requisite checks ---
-    if section_raw_start is None or section_raw_end is None or not source_md_filename:
-        print(
-            f"  ERROR: Missing 'start_pos', 'end_pos', or 'source_markdown_file' needed for splitting. Skipping {input_filename}."
-        )
-        return 0
-
-    # --- Find and Read Original Markdown ---
-    original_md_path = find_original_md(
-        source_md_filename, original_md_dir
-    )  # Use helper
-    if not original_md_path:
-        print(
-            f"  ERROR: Could not locate original MD file '{source_md_filename}'. Skipping split."
-        )
-        return 0
-    try:
-        with open(original_md_path, "r", encoding="utf-8") as f:
-            raw_chapter_content = f.read()
-    except Exception as e:
-        print(
-            f"  ERROR: Could not read original MD file '{original_md_path}': {e}. Skipping split."
-        )
-        return 0
-
-    # --- Extract Tags and Split Content ---
-    # Get all tags from the raw chapter content
-    full_tag_mapping = extract_tag_mapping(raw_chapter_content)
-    # Filter to get only tags within this section's raw boundaries
-    section_tag_mapping = [
-        tag
-        for tag in full_tag_mapping
-        if tag["start"] >= section_raw_start and tag["end"] <= section_raw_end
-    ]
-
-    # Split the cleaned content into sub-chunks based on paragraphs/sentences
-    split_sub_chunks = split_large_section_content(cleaned_content, MAX_TOKENS)
-    print(f"  Split into {len(split_sub_chunks)} potential sub-chunks.")
-
-    # --- Process and Save Unique Sub-Chunks ---
-    seen_content_hashes = set()  # Track hashes to deduplicate *within this section*
-    split_part_index = 0  # Index for the output parts (starts at 1)
-
-    for sub_chunk in split_sub_chunks:
-        # Calculate content hash for deduplication
-        content_hash = hashlib.md5(sub_chunk["content"].encode("utf-8")).hexdigest()
-        if content_hash in seen_content_hashes:
-            print(
-                f"    Skipping duplicate content sub-chunk (Hash: {content_hash[:8]}...)."
-            )
-            continue
-        seen_content_hashes.add(content_hash)
-
-        split_part_index += 1  # Increment part number for unique chunks
-
-        # Map the sub-chunk's clean start/end positions back to raw positions
-        chunk_raw_start = map_clean_to_raw_pos(
-            sub_chunk["clean_start_pos"], section_raw_start, section_tag_mapping
-        )
-        chunk_raw_end = map_clean_to_raw_pos(
-            sub_chunk["clean_end_pos"], section_raw_start, section_tag_mapping
-        )
-
-        # Prepare the data dictionary for the final chunk JSON
-        final_chunk_data = section_data.copy()  # Start with original section metadata
-        final_chunk_data["content"] = sub_chunk["content"]  # Use the sub-chunk content
-        final_chunk_data["chunk_token_count"] = sub_chunk[
-            "token_count"
-        ]  # Sub-chunk token count
-        final_chunk_data["chunk_part_number"] = (
-            split_part_index  # Part number (1, 2, ...)
-        )
-        final_chunk_data["start_pos"] = chunk_raw_start  # Updated raw start position
-        final_chunk_data["end_pos"] = chunk_raw_end  # Updated raw end position
-        final_chunk_data.pop(
-            "token_count", None
-        )  # Remove original section's token count
-
-        # Append "(Part X)" to the most specific heading for identification
-        heading_key = f"level_{final_chunk_data.get('level', 0)}"
-        if heading_key in final_chunk_data:
-            heading_text = final_chunk_data[heading_key]
-            # Avoid adding suffix multiple times if script is rerun
-            if not re.search(r" \(Part \d+\)$", heading_text):
-                final_chunk_data[heading_key] = (
-                    f"{heading_text} (Part {split_part_index})"
-                )
-        # Consider adding to chapter_name as well if no specific heading?
-
-        # Generate output filename and save the chunk
-        output_filename = _generate_output_filename(input_filename, split_part_index)
-        output_filepath = os.path.join(output_dir, output_filename)
-        try:
-            with open(output_filepath, "w", encoding="utf-8") as f:
-                json.dump(final_chunk_data, f, indent=2, ensure_ascii=False)
-            saved_chunk_count += 1
-        except Exception as e:
-            print(f"  ERROR saving chunk {output_filename}: {e}")
-            # Continue processing other chunks even if one fails to save
-
-    print(f"  Saved {saved_chunk_count} unique chunks after splitting.")
-    return saved_chunk_count
-
-
-def process_paged_section_json(
-    section_json_path: str, original_md_dir: str, output_dir: str
-) -> int:
-    """
-    Processes a single paged section JSON file from Stage 3.
-
-    Loads the section data, checks if it needs splitting based on `MAX_TOKENS`.
-    Calls the appropriate handler (`_handle_section_within_limit` or
-    `_handle_section_needs_splitting`) to process and save the final chunk(s).
-
-    Args:
-        section_json_path: Path to the input paged section JSON file.
-        original_md_dir: Directory containing original markdown files.
-        output_dir: Directory to save the final chunk JSON files.
-
-    Returns:
-        The number of final chunks saved for this section (0 or 1 if not split,
-        potentially more if split, 0 on error).
-    """
-    input_filename = os.path.basename(section_json_path)
     try:
         print(f"Processing Stage 4 for: {input_filename}")
 
-        # Load section data
-        with open(section_json_path, "r", encoding="utf-8") as f:
+        # 1. Read section JSON from Stage 3
+        with open(section_json_path, 'r', encoding='utf-8') as f:
             section_data = json.load(f)
 
-        # Check token count against the limit
-        original_token_count = section_data.get("token_count", 0)
+        original_token_count = section_data.get('token_count', 0)
+        # Use 'content' key as per original script and user code context
+        cleaned_content = section_data.get('content', '')
+        original_raw_start = section_data.get('start_pos')
+        original_raw_end = section_data.get('end_pos') # Needed for tag filtering
+        source_md_filename = section_data.get('source_markdown_file')
 
+        # --- Check if splitting is needed ---
         if original_token_count <= MAX_TOKENS:
-            # Section is within limit, save as single chunk
-            return _handle_section_within_limit(
-                section_data, input_filename, output_dir
-            )
+            # No splitting needed, just format and save
+            print(f"  Section token count ({original_token_count}) is within limit. Saving as single chunk.")
+            final_chunk_data = section_data.copy()
+            final_chunk_data['chunk_part_number'] = 0  # Not split
+            # Add chunk_token_count for consistency, even if same as original
+            final_chunk_data['chunk_token_count'] = original_token_count
+            final_chunk_data.pop('token_count', None) # Remove original key
+
+            # Find a clean filename: chX_secY_name_part000.json
+            match = re.match(r'(\d+)_(\d+)_(.+)\.json', input_filename)
+            if match:
+                chap_num_str, sec_idx_str, base_name = match.groups()
+                # Clean base name similar to original script's helper
+                clean_base_name = cleanup_filename(base_name)
+                # Use user's preferred format _partXXX.json
+                output_filename = f"{chap_num_str}_{sec_idx_str}_{clean_base_name}_part000.json"
+            else:
+                # Fallback filename if pattern doesn't match
+                base = os.path.splitext(input_filename)[0]
+                clean_base = cleanup_filename(base)
+                output_filename = f"{clean_base}_part000.json"
+
+            output_filepath = os.path.join(output_dir, output_filename)
+
+            # Save the single chunk
+            try:
+                with open(output_filepath, 'w', encoding='utf-8') as f:
+                    json.dump(final_chunk_data, f, indent=2, ensure_ascii=False)
+                saved_chunk_count = 1
+            except Exception as e:
+                 print(f"  ERROR saving chunk {output_filename}: {e}")
+                 saved_chunk_count = 0 # Explicitly set to 0 on save error
+
         else:
-            # Section exceeds limit, needs splitting
-            return _handle_section_needs_splitting(
-                section_data, input_filename, original_md_dir, output_dir
-            )
+            # --- Splitting is needed ---
+            print(f"  Section token count ({original_token_count}) exceeds limit ({MAX_TOKENS}). Splitting...")
+
+            # Use original script's checks for necessary data
+            if original_raw_start is None or original_raw_end is None or not source_md_filename:
+                print(f"  ERROR: Missing 'start_pos', 'end_pos', or 'source_markdown_file' needed for splitting. Skipping {input_filename}.")
+                return 0 # Return 0 chunks saved
+
+            # Read original MD file for raw content and tag mapping
+            # Use find_original_md helper from original script for robustness
+            original_md_path = find_original_md(source_md_filename, original_md_dir)
+            if not original_md_path:
+                 print(f"  ERROR: Could not locate original MD file '{source_md_filename}'. Skipping split.")
+                 return 0
+
+            try:
+                with open(original_md_path, 'r', encoding='utf-8') as f:
+                    raw_chapter_content = f.read()
+            except Exception as e:
+                print(f"  ERROR: Could not read original MD file '{original_md_path}': {e}. Skipping split.")
+                return 0
+
+            # Extract tag mapping relevant to this section's raw slice
+            full_tag_mapping = extract_tag_mapping(raw_chapter_content)
+            section_tag_mapping = [
+                tag for tag in full_tag_mapping
+                if tag['start'] >= original_raw_start and tag['end'] <= original_raw_end
+            ]
+
+            # Split the cleaned content using the new function
+            split_sub_chunks = split_large_section_content(cleaned_content, MAX_TOKENS)
+            print(f"  Split into {len(split_sub_chunks)} potential sub-chunks.")
+
+            # Deduplicate and save
+            seen_content_hashes = set()
+            split_part_index = 0  # Start part numbering from 1
+
+            for sub_chunk in split_sub_chunks:
+                # Calculate content hash for deduplication
+                content_hash = hashlib.md5(sub_chunk['content'].encode('utf-8')).hexdigest()
+
+                if content_hash in seen_content_hashes:
+                    print(f"    Skipping duplicate content chunk (hash: {content_hash[:8]}...)")
+                    continue
+
+                seen_content_hashes.add(content_hash)
+                split_part_index += 1  # Increment part number for unique chunks
+
+                # Map clean positions back to raw positions using helper from original script
+                chunk_raw_start = map_clean_to_raw_pos(sub_chunk['clean_start_pos'], original_raw_start, section_tag_mapping)
+                chunk_raw_end = map_clean_to_raw_pos(sub_chunk['clean_end_pos'], original_raw_start, section_tag_mapping)
+
+                # Create the final chunk data
+                final_chunk_data = section_data.copy()  # Start with original section metadata
+                final_chunk_data['content'] = sub_chunk['content']
+                final_chunk_data['chunk_token_count'] = sub_chunk['token_count']
+                final_chunk_data['chunk_part_number'] = split_part_index
+                final_chunk_data['start_pos'] = chunk_raw_start  # Update raw positions
+                final_chunk_data['end_pos'] = chunk_raw_end
+
+                # Add (Part X) to the most specific heading using helper from original script
+                heading_key = f"level_{final_chunk_data.get('level', 0)}"
+                if heading_key in final_chunk_data:
+                     heading_text = final_chunk_data[heading_key]
+                     # Avoid adding suffix multiple times if script is rerun
+                     if not re.search(r" \(Part \d+\)$", heading_text):
+                         final_chunk_data[heading_key] = f"{heading_text} (Part {split_part_index})"
+
+                # Remove original token_count
+                final_chunk_data.pop('token_count', None)
+
+                # Construct filename using user's preferred format _partXXX.json
+                match = re.match(r'(\d+)_(\d+)_(.+)\.json', input_filename)
+                if match:
+                    chap_num_str, sec_idx_str, base_name = match.groups()
+                    # Clean base name
+                    clean_base_name = cleanup_filename(base_name)
+                    # Remove potential existing suffix before adding new one
+                    clean_base_name = re.sub(r"(_part|_Part|_)\d+$", "", clean_base_name)
+                    output_filename = f"{chap_num_str}_{sec_idx_str}_{clean_base_name}_part{split_part_index:03d}.json"
+                else:
+                    # Fallback filename if pattern doesn't match
+                    base = os.path.splitext(input_filename)[0]
+                    clean_base = cleanup_filename(base)
+                    clean_base = re.sub(r"(_part|_Part|_)\d+$", "", clean_base) # Clean suffix here too
+                    output_filename = f"{clean_base}_part{split_part_index:03d}.json"
+
+                output_filepath = os.path.join(output_dir, output_filename)
+
+                # Save the chunk
+                try:
+                    with open(output_filepath, 'w', encoding='utf-8') as f:
+                        json.dump(final_chunk_data, f, indent=2, ensure_ascii=False)
+                    saved_chunk_count += 1
+                except Exception as e:
+                    print(f"  ERROR saving chunk {output_filename}: {e}")
+                    # Continue processing other chunks
+
+            print(f"  Saved {saved_chunk_count} unique chunks after splitting.")
 
     except Exception as e:
         print(f"\nERROR processing section file {input_filename} in Stage 4: {e}")
         print(traceback.format_exc())
-        return 0  # Indicate failure for this section file
+        return 0 # Indicate failure for this section file
+
+    return saved_chunk_count
 
 
 def main():
