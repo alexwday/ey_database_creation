@@ -28,6 +28,7 @@ from pathlib import Path
 import psycopg2
 import psycopg2.extras # For DictCursor
 from openai import OpenAI, APIError
+from pgvector.psycopg2 import register_vector
 
 # --- Configuration ---
 # Source document ID to search within (optional, set to None to search all)
@@ -75,7 +76,7 @@ def connect_to_db(params):
         print(f"Connecting to database '{params['dbname']}' on {params['host']}...")
         conn = psycopg2.connect(**params)
         # Register pgvector type handler
-        psycopg2.extras.register_vector(conn)
+        register_vector(conn)
         print("Connection successful and pgvector registered.")
         return conn
     except Exception as e:

@@ -21,6 +21,7 @@ import traceback
 from pathlib import Path
 import psycopg2
 import psycopg2.extras # For DictCursor
+from pgvector.psycopg2 import register_vector
 
 # --- Configuration ---
 # Source document ID to check
