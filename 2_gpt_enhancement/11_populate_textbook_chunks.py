@@ -79,10 +79,12 @@ def prepare_data_for_insert(records):
     data_tuples = []
     print("Preparing data for insertion...")
     skipped_count = 0
+    # Keys expected in the JSON record based on script 9/10 and corrected schema
     required_keys = [
-        "document_id", "chapter_name", "standard_codes", "embedding",
-        "sequence_number", "section_references", "page_start", "page_end",
-        "summary", "importance_score", "section_hierarchy", "section_title",
+        "document_id", "chapter_name", "tags", "standard", "standard_codes",
+        "embedding", "sequence_number", "section_references", "page_start",
+        "page_end", "summary", "importance_score", "section_hierarchy",
+        "section_title",
         "content"
     ]
 
@@ -115,12 +117,12 @@ def prepare_data_for_insert(records):
              continue
 
 
-        # Order must match the INSERT statement columns
+        # Order must match the INSERT statement columns below
         data_tuples.append((
             record.get("document_id"),
             record.get("chapter_name"),
-            # standard TEXT[] - Skipped (JSON has string 'standard')
-            # standard_org VARCHAR(100) - Skipped (Not in JSON)
+            record.get("tags"), # TEXT[]
+            record.get("standard"), # VARCHAR(100)
             record.get("standard_codes"), # TEXT[]
             embedding, # VECTOR(2000)
             sequence_number, # INT
@@ -181,10 +183,10 @@ def populate_textbook_chunks():
         # IMPORTANT: Column order must match the data_tuples order
         insert_sql = """
             INSERT INTO textbook_chunks (
-                document_id, chapter_name, standard_codes, embedding,
-                sequence_number, section_references, page_start, page_end,
-                summary, importance_score, section_hierarchy, section_title,
-                content
+                document_id, chapter_name, tags, standard, standard_codes,
+                embedding, sequence_number, section_references, page_start,
+                page_end, summary, importance_score, section_hierarchy,
+                section_title, content
             ) VALUES %s;
         """
         psycopg2.extras.execute_values(
