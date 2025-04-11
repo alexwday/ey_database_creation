@@ -277,14 +277,16 @@ def perform_hybrid_search(cursor, query: str, query_embedding: list[float], top_
                     c.id,
                     c.sequence_number,
                     c.document_id,
-                    c.chapter_number,
                     c.chapter_name,
-                    c.section_number,
+                    c.section_hierarchy,
                     c.section_title,
                     c.content,
                     c.standard,
                     c.standard_codes,
                     c.tags,
+                    c.page_start,
+                    c.page_end, 
+                    c.importance_score,
                     COALESCE(v.vector_score, 0) AS vector_score,
                     COALESCE(t.text_score, 0) AS text_score,
                     (COALESCE(v.vector_score, 0) * 0.7) + (COALESCE(t.text_score, 0) * 0.3) AS combined_score
@@ -333,12 +335,26 @@ def format_chunks_as_cards(results):
         
         # Card metadata
         chapter_name = record.get('chapter_name', 'Unknown Chapter')
-        chapter_number = record.get('chapter_number', 'Unknown')
+        # Extract chapter number from section_hierarchy if available
+        section_hierarchy = record.get('section_hierarchy', '')
         section_title = record.get('section_title', 'Unknown Section')
-        section_number = record.get('section_number', 'Unknown')
         
-        card_parts.append(f"Chapter {chapter_number}: {chapter_name}")
-        card_parts.append(f"Section {section_number}: {section_title}")
+        # Format chapter and section info
+        card_parts.append(f"Chapter: {chapter_name}")
+        card_parts.append(f"Section: {section_title}")
+        if section_hierarchy:
+            card_parts.append(f"Section Hierarchy: {section_hierarchy}")
+        
+        # Add page range if available
+        page_start = record.get('page_start')
+        page_end = record.get('page_end')
+        if page_start and page_end:
+            card_parts.append(f"Pages: {page_start}-{page_end}")
+        
+        # Add importance score if available
+        importance_score = record.get('importance_score')
+        if importance_score is not None:
+            card_parts.append(f"Importance Score: {importance_score:.2f}")
         
         # Add standard information if available
         standard = record.get('standard')
