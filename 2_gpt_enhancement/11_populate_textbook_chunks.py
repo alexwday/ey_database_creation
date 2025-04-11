@@ -116,6 +116,11 @@ def prepare_data_for_insert(records):
              skipped_count += 1
              continue
 
+        # Prepare and truncate potentially long fields before appending
+        section_hierarchy_orig = record.get("section_hierarchy") or ""
+        section_title_orig = record.get("section_title") or ""
+        section_hierarchy_trunc = section_hierarchy_orig[:500]
+        section_title_trunc = section_title_orig[:500]
 
         # Order must match the INSERT statement columns below
         data_tuples.append((
@@ -131,10 +136,17 @@ def prepare_data_for_insert(records):
             page_end, # INT
             record.get("summary"), # TEXT
             importance_score, # FLOAT
-            record.get("section_hierarchy"), # VARCHAR(500)
-            record.get("section_title"), # VARCHAR(500)
+            section_hierarchy_trunc, # Use truncated value
+            section_title_trunc, # Use truncated value
             content # TEXT NOT NULL
         ))
+
+        # Log truncation events (using original values for length check)
+        if len(section_hierarchy_orig) > 500:
+            print(f"WARNING: Record sequence_number={sequence_number}: Truncated 'section_hierarchy' (orig_len={len(section_hierarchy_orig)})", file=sys.stderr)
+        if len(section_title_orig) > 500:
+            print(f"WARNING: Record sequence_number={sequence_number}: Truncated 'section_title' (orig_len={len(section_title_orig)})", file=sys.stderr)
+
 
     if skipped_count > 0:
          print(f"WARNING: Skipped {skipped_count} records due to missing keys, invalid embedding, or empty content.", file=sys.stderr)
