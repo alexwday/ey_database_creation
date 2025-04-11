@@ -154,6 +154,63 @@ def check_max_lengths(cursor, doc_id):
         print(f"ERROR: Failed to check max lengths: {e}", file=sys.stderr)
         return None, None
 
+def check_text_search_setup(cursor, doc_id):
+    """Verifies the text_search_vector column setup."""
+    print(f"\n--- Checking Text Search Setup for document_id='{doc_id}' ---")
+    try:
+        # Check if column exists
+        cursor.execute("""
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = 'textbook_chunks' AND column_name = 'text_search_vector';
+        """)
+        column_info = cursor.fetchone()
+        
+        if not column_info:
+            print("ERROR: text_search_vector column not found in the table!")
+            return False
+            
+        print(f"✅ text_search_vector column exists (type: {column_info[1]})")
+        
+        # Check if vectors are populated for this document
+        cursor.execute("""
+            SELECT COUNT(*), COUNT(text_search_vector)
+            FROM textbook_chunks
+            WHERE document_id = %s;
+        """, (doc_id,))
+        total_count, vector_count = cursor.fetchone()
+        print(f"Total records: {total_count}, Records with text vectors: {vector_count}")
+        
+        if vector_count < total_count:
+            print(f"WARNING: {total_count - vector_count} records have NULL text_search_vector")
+        else:
+            print("✅ All records have text search vectors populated")
+        
+        # Check for index
+        cursor.execute("""
+            SELECT indexname FROM pg_indexes 
+            WHERE tablename = 'textbook_chunks' AND indexdef LIKE '%text_search_vector%';
+        """)
+        index = cursor.fetchone()
+        
+        if not index:
+            print("WARNING: No index found on text_search_vector column!")
+        else:
+            print(f"✅ Text search index exists: {index[0]}")
+        
+        # Run a sample text search query to verify functionality
+        cursor.execute("""
+            SELECT COUNT(*) FROM textbook_chunks 
+            WHERE document_id = %s AND text_search_vector @@ to_tsquery('english', 'accounting');
+        """, (doc_id,))
+        search_count = cursor.fetchone()[0]
+        print(f"Sample keyword search for 'accounting' found {search_count} matches")
+        
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to check text search setup: {e}", file=sys.stderr)
+        return False
+
 # --- Main Execution Function ---
 def verify_insertion():
     """Connects to DB and runs verification checks."""
@@ -172,6 +229,7 @@ def verify_insertion():
         embedding_count = check_embedding_count(cursor, DOCUMENT_ID_TO_CHECK)
         fetch_first_record(cursor, DOCUMENT_ID_TO_CHECK)
         check_max_lengths(cursor, DOCUMENT_ID_TO_CHECK)
+        check_text_search_setup(cursor, DOCUMENT_ID_TO_CHECK)
 
         # Compare DB count with input file count (optional)
         if INPUT_JSON_PATH_FOR_COUNT:

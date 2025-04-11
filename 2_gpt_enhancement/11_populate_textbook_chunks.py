@@ -175,6 +175,18 @@ def populate_textbook_chunks():
     try:
         cursor = conn.cursor()
 
+        # 0. Ensure text_search_vector column exists (for keyword search)
+        print("Ensuring text_search_vector column exists...")
+        cursor.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'textbook_chunks' AND column_name = 'text_search_vector';
+        """)
+        if not cursor.fetchone():
+            print("Adding text_search_vector column to the table...")
+            cursor.execute("ALTER TABLE textbook_chunks ADD COLUMN text_search_vector tsvector;")
+            print("Column added successfully.")
+        
         # 1. Delete existing records for the specified document_id
         print(f"Deleting existing records for document_id: '{DOCUMENT_ID_TO_REPLACE}'...")
         delete_sql = "DELETE FROM textbook_chunks WHERE document_id = %s;"
@@ -199,19 +211,48 @@ def populate_textbook_chunks():
                 embedding, sequence_number, section_references, page_start,
                 page_end, summary, importance_score, section_hierarchy,
                 section_title, content
-            ) VALUES %s;
+            ) VALUES %s
+            RETURNING id;
         """
-        psycopg2.extras.execute_values(
+        # Execute the insert and get the IDs
+        inserted_ids = psycopg2.extras.execute_values(
             cursor,
             insert_sql,
             data_tuples,
             template=None,
-            page_size=100 # Adjust batch size as needed
+            page_size=100, # Adjust batch size as needed
+            fetch=True  # Return the inserted IDs
         )
-        inserted_count = cursor.rowcount # Note: execute_values might report total rows affected across batches
-        print(f"Successfully inserted records (cursor.rowcount reports: {inserted_count}).") # Report might not be exact count with execute_values
+        inserted_count = len(inserted_ids) if inserted_ids else cursor.rowcount
+        print(f"Successfully inserted {inserted_count} records.")
+        
+        # 4. Update text_search_vector for the inserted records
+        print("Updating text_search_vector for full-text search capabilities...")
+        update_sql = """
+            UPDATE textbook_chunks 
+            SET text_search_vector = to_tsvector('english', 
+                COALESCE(content, '') || ' ' || 
+                COALESCE(section_title, '') || ' ' || 
+                COALESCE(chapter_name, '')
+            )
+            WHERE document_id = %s;
+        """
+        cursor.execute(update_sql, (DOCUMENT_ID_TO_REPLACE,))
+        updated_count = cursor.rowcount
+        print(f"Updated text_search_vector for {updated_count} records.")
+        
+        # 5. Ensure text search index exists
+        print("Checking if text search index exists...")
+        cursor.execute("""
+            SELECT indexname FROM pg_indexes 
+            WHERE tablename = 'textbook_chunks' AND indexdef LIKE '%text_search_vector%';
+        """)
+        if not cursor.fetchone():
+            print("Creating GIN index on text_search_vector...")
+            cursor.execute("CREATE INDEX idx_textbook_chunks_tsv ON textbook_chunks USING GIN(text_search_vector);")
+            print("GIN index created for faster text search.")
 
-        # 4. Commit transaction
+        # 6. Commit transaction
         print("Committing transaction...")
         conn.commit()
         print("Transaction committed successfully.")
