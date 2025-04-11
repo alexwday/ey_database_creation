@@ -296,7 +296,7 @@ def perform_hybrid_search(cursor, query: str, query_embedding: list[float], init
                     c.section_hierarchy,
                     c.section_title,
                     c.content,
-                    c.summary, # Added summary field
+                    c.summary,
                     c.standard,
                     c.standard_codes,
                     c.tags,
