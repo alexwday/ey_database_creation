@@ -262,33 +262,50 @@ def perform_keyword_search(cursor, query: str, top_k: int, doc_id: str | None):
     print(f"\n--- Performing Keyword Search (Top {top_k}) ---")
     results = []
     try:
+        # Extract words, filter out very short ones that could be noise
+        words = [w for w in query.strip().split() if len(w) > 2]
+        
+        if not words:
+            print("Warning: Query contains no usable keywords after filtering.")
+            words = query.strip().split()  # Use all words if filtering removed everything
+            
+        # Create OR-based query to find documents with ANY of the keywords
+        or_query = ' | '.join(words)
+        print(f"Searching for documents containing any of these terms: {or_query}")
+            
         # Check if websearch_to_tsquery is available (PostgreSQL 11+)
         cursor.execute("SELECT 1 FROM pg_proc WHERE proname = 'websearch_to_tsquery'")
         has_websearch = cursor.fetchone() is not None
         
         # Use websearch_to_tsquery if available, fall back to to_tsquery
-        # websearch_to_tsquery handles phrases in quotes, OR/AND operators, and - for negation
         if has_websearch:
             print("Using websearch_to_tsquery for more flexible search...")
             tsquery_func = "websearch_to_tsquery"
+            # Keep original query for websearch_to_tsquery as it handles operators
+            search_query = query
         else:
-            print("Using to_tsquery with OR logic for more matches...")
-            # Convert query to OR-based search by joining terms with |
-            words = query.strip().split()
-            query = ' | '.join(words)
+            print("Using to_tsquery with OR logic...")
             tsquery_func = "to_tsquery"
+            # Use our OR-based query for to_tsquery
+            search_query = or_query
             
-        # Enhanced ranking with normalization and weights
+        # Enhanced ranking with combined normalization:
+        # - 2: Normalize by document length (fair comparison between short/long chunks)
+        # - 32: Compress scores between 0-1 to avoid extreme values
+        # Multiply by 10 for more readable scores
         sql = f"""
             SELECT
                 id,
                 sequence_number,
                 content,
-                ts_rank_cd(text_search_vector, {tsquery_func}('english', %s), 32) * 10 AS rank
+                chapter_name,
+                section_title,
+                ts_rank_cd(text_search_vector, {tsquery_func}('english', %s), 2|32) * 10 AS rank,
+                LENGTH(content) AS content_length
             FROM textbook_chunks
             WHERE text_search_vector @@ {tsquery_func}('english', %s)
         """
-        params = [query, query]
+        params = [search_query, search_query]
 
         if doc_id:
             sql += " AND document_id = %s"
@@ -315,8 +332,32 @@ def display_results(search_type: str, results: list, score_field: str):
         return
 
     for i, record in enumerate(results):
-        print(f"{i+1}. ID: {record['id']}, Seq: {record['sequence_number']}, Score/Rank: {record[score_field]:.4f}")
-        print(f"   Content: {str(record['content'])[:200]}...") # Show more preview
+        # Show score with consistent formatting
+        score = record[score_field]
+        score_display = f"{score:.4f}" if isinstance(score, float) else str(score)
+        
+        # Get content length if available, otherwise calculate it
+        if 'content_length' in record:
+            content_length = record['content_length']
+        else:
+            content_length = len(str(record['content']))
+            
+        # Format section information
+        section_info = ""
+        if 'chapter_name' in record and record['chapter_name']:
+            section_info = f"Chapter: {record['chapter_name']}"
+        if 'section_title' in record and record['section_title']:
+            if section_info:
+                section_info += f" | Section: {record['section_title']}"
+            else:
+                section_info = f"Section: {record['section_title']}"
+        
+        # Print result with improved formatting
+        print(f"{i+1}. ID: {record['id']}, Seq: {record['sequence_number']}, " +
+              f"Score: {score_display}, Length: {content_length}")
+        if section_info:
+            print(f"   {section_info}")
+        print(f"   Preview: {str(record['content'])[:150]}...")
 
 # --- Main Execution Function ---
 def check_text_search_setup(cursor):
