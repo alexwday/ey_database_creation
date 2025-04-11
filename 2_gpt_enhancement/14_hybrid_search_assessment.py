@@ -518,11 +518,13 @@ def expand_short_sections(cursor, results: list[dict], top_k_threshold: int, gen
 
                 if num_found > 1: # Only expand if there are actually more chunks in DB
                     section_chunks = [dict(chunk) for chunk in section_chunks_raw]
+                    # Assign the 'new_score' (calculated in the previous reranking step) to the group for sorting
                     group_info = {
                         'type': 'group',
                         'original_rank': rank,
-                        'original_combined_score': record.get('combined_score'),
-                        'original_importance_score': record.get('importance_score'),
+                        'original_combined_score': record.get('combined_score'), # Keep for reference if needed
+                        'original_importance_score': record.get('importance_score'), # Keep for reference if needed
+                        'new_score': record.get('new_score', 0.0), # Use the score calculated earlier
                         'chunks': section_chunks
                     }
                     processed_results.append(group_info)
@@ -565,9 +567,10 @@ def expand_short_sections(cursor, results: list[dict], top_k_threshold: int, gen
 def fill_page_gaps(cursor, results: list[dict | list[dict]], max_gap: int) -> tuple[list[dict | list[dict]], set]:
     """
     Identifies small page gaps between consecutive results and fetches missing chunks.
-    Handles both single chunks and groups. Returns the updated list and a set of added chunk IDs.
+    Handles both single chunks and groups. Assigns a 'new_score' to gap chunks based on the preceding item.
+    Returns the updated list and a set of added chunk IDs.
     """
-    print(f"\n--- Step 3: Filling page gaps (Max Gap: {max_gap} pages) ---")
+    print(f"\n--- Step 5: Filling page gaps (Max Gap: {max_gap} pages) ---") # Step number updated
     if len(results) < 2:
         return results, set() # Need at least two items to have a gap
 
@@ -636,15 +639,26 @@ def fill_page_gaps(cursor, results: list[dict | list[dict]], max_gap: int) -> tu
                         gap_chunks_raw = cursor.fetchall()
                         num_added = len(gap_chunks_raw)
                         if num_added > 0:
-                            gap_chunks = [dict(chunk) for chunk in gap_chunks_raw]
-                            final_results_with_gaps.extend(gap_chunks) # Add gap chunks
-                            log_row[3] = f"Fill Gap ({num_added} chunks)"
+                            # Calculate average score of surrounding items
+                            preceding_score = last_item_info.get('item', {}).get('new_score', 0.0)
+                            following_score = current_item_info.get('item', {}).get('new_score', 0.0)
+                            # Handle potential None scores if reranking failed for an item
+                            preceding_score = preceding_score if preceding_score is not None else 0.0
+                            following_score = following_score if following_score is not None else 0.0
+                            average_score = (preceding_score + following_score) / 2.0
+
+                            gap_chunks = []
+                            for chunk_raw in gap_chunks_raw:
+                                chunk = dict(chunk_raw)
+                                chunk['new_score'] = average_score # Assign average score
+                                gap_chunks.append(chunk)
+                                if chunk.get('id'): added_chunk_ids.add(chunk.get('id')) # Track added IDs
+
+                            final_results_with_gaps.extend(gap_chunks) # Add gap chunks with scores
+                            log_row[3] = f"Fill Gap ({num_added} chunks, Avg Score ~{average_score:.4f})"
                             log_row[4] = num_added
-                            # Track added IDs
-                            for chunk in gap_chunks:
-                                if chunk.get('id'): added_chunk_ids.add(chunk.get('id'))
                         else:
-                            # print(f"    No chunks found in DB for gap between seq {last_item_info['max_seq']} and {current_item_info['min_seq']}.") # Replaced by table
+                            # print(f"    No chunks found in DB for gap between seq {last_item_info['max_seq']} and {current_item_info['min_seq']}.")
                             log_row[3] = "No Chunks Found"
                             log_row[4] = 0
                     except Exception as e:
@@ -683,38 +697,26 @@ def fill_page_gaps(cursor, results: list[dict | list[dict]], max_gap: int) -> tu
 
 def rerank_by_importance(results: list[dict | list[dict]], importance_factor: float) -> list[dict | list[dict]]:
     """
-    Calculates a new score based on original combined score and importance score.
-    Handles both single chunks and groups.
+    Calculates and assigns 'new_score' based on original combined score and importance score.
+    Handles both single chunks and groups. Does NOT sort the list.
+    Input list should only contain items from initial search + filtering.
     """
-    print(f"\n--- Step 4: Reranking by importance (Factor: {importance_factor}) ---")
+    print(f"\n--- Step 3: Calculating Importance-Boosted Scores (Factor: {importance_factor}) ---") # Step number updated
     if not results: return []
 
-    reranked_results = []
+    processed_items = [] # Use a new list to avoid modifying input directly if needed later
+    # This function now only processes items that came from the initial search/filtering
+    # It should not encounter 'group' types or raw DictRows from gap filling.
     for item in results:
-        new_score = 0.0
-        original_score = 0.0
-        importance = 0.0
+        if not isinstance(item, dict):
+             print(f"WARNING: Skipping unexpected item type in reranking: {type(item)}", file=sys.stderr)
+             continue
 
-        if isinstance(item, dict) and item.get('type') == 'group':
-            # Group: Use scores from the original triggering chunk
-            original_score = item.get('original_combined_score', 0.0) or 0.0
-            importance = item.get('original_importance_score', 0.0) or 0.0
-            item_id = f"Group starting with chunk {item['chunks'][0].get('id', 'N/A')}" # For logging
-        elif isinstance(item, dict):
-            # Single chunk
-            original_score = item.get('combined_score', 0.0) or 0.0
-            importance = item.get('importance_score', 0.0) or 0.0
-            item_id = f"Chunk {item.get('id', 'N/A')}" # For logging
-        else:
-             # Handle unexpected items (e.g., gap-filled chunks might not be dicts if fetch failed)
-             if isinstance(item, psycopg2.extras.DictRow):
-                 item = dict(item) # Convert if necessary
-                 original_score = item.get('combined_score', 0.0) or 0.0 # Might be missing if it's a gap chunk
-                 importance = item.get('importance_score', 0.0) or 0.0
-                 item_id = f"Gap Chunk {item.get('id', 'N/A')}"
-             else:
-                print(f"WARNING: Skipping unexpected item type in reranking: {type(item)}", file=sys.stderr)
-                continue
+        new_score = 0.0
+        # Expecting 'combined_score' from initial search and 'importance_score'
+        original_score = item.get('combined_score', 0.0) or 0.0
+        importance = item.get('importance_score', 0.0) or 0.0
+        item_id = f"Chunk {item.get('id', 'N/A')}"
 
         # Calculate new score: new_score = original_score * (1 + factor * importance)
         # Ensure scores are floats
@@ -723,19 +725,39 @@ def rerank_by_importance(results: list[dict | list[dict]], importance_factor: fl
             importance = float(importance)
             boost = 1.0 + (importance_factor * importance)
             new_score = original_score * boost
-            # print(f"  - {item_id}: Orig Score={original_score:.4f}, Importance={importance:.2f}, Boost={boost:.4f}, New Score={new_score:.4f}")
+            # print(f"  - {item_id}: Orig Score={original_score:.4f}, Importance={importance:.2f}, Boost={boost:.4f}, New Score={new_score:.4f}") # Optional detailed log
         except (TypeError, ValueError) as e:
             print(f"WARNING: Could not calculate score for {item_id} due to invalid numeric values (Orig: {original_score}, Importance: {importance}). Setting new_score to 0. Error: {e}", file=sys.stderr)
             new_score = 0.0 # Default score on error
 
-        # Add the new score to the item (or group dict)
-        if isinstance(item, dict):
-            item['new_score'] = new_score
-            reranked_results.append(item)
-        # We don't need to handle DictRow separately here as it should have been converted
+        # Assign the calculated score
+        item['new_score'] = new_score
+        processed_items.append(item)
 
-    print(f"Finished importance reranking for {len(reranked_results)} items.")
-    return reranked_results
+    print(f"Finished calculating importance-boosted scores for {len(processed_items)} items.")
+    # Return the list with 'new_score' assigned, maintaining original order for now.
+    # Return the list with 'new_score' assigned, maintaining original order for now.
+    return processed_items
+
+
+# --- Helper function for sorting ---
+def get_min_sequence_number(item):
+    """Gets the minimum sequence number for a chunk or a group."""
+    if isinstance(item, dict) and item.get('type') == 'group':
+        # For groups, find the min sequence number among its chunks
+        try:
+            return min(c.get('sequence_number') for c in item.get('chunks', []) if c.get('sequence_number') is not None)
+        except (ValueError, TypeError):
+            return float('inf') # Return infinity if no valid sequence number found
+    elif isinstance(item, dict):
+        # For single chunks (including gap-filled ones if they are dicts)
+        seq = item.get('sequence_number')
+        return seq if seq is not None else float('inf')
+    elif isinstance(item, psycopg2.extras.DictRow):
+         # Handle potential DictRow from gap filling if not converted earlier
+         seq = item['sequence_number']
+         return seq if seq is not None else float('inf')
+    return float('inf') # Default for unexpected types
 
 
 # --- Response Generation Functions ---
@@ -1012,9 +1034,9 @@ def generate_response(query: str):
         filtered_results, relevance_map = filter_by_summary_relevance(client, query, processed_results)
         if not filtered_results: return "No relevant information remained after summary filtering."
 
-        # Log relevance filtering results
+        # Log relevance filtering results (excluding long summary)
         relevance_table_data = []
-        headers_relevance = ["Chunk ID", "Chapter", "Relevance (1=Yes, 0=No)", "Summary"]
+        headers_relevance = ["Chunk ID", "Chapter", "Pages", "Relevance (1=Yes, 0=No)"] # Removed Summary
         current_filtered_ids = set()
         for record in filtered_results:
              chunk_id = record.get('id')
@@ -1025,29 +1047,41 @@ def generate_response(query: str):
              relevance_score = relevance_map.get(str(chunk_id), "N/A (Not Processed)")
              if relevance_score == 0:
                  all_removed_chunk_ids.add(chunk_id) # Track removed IDs
+             page_start = record.get('page_start', 'N/A')
+             page_end = record.get('page_end', 'N/A')
+             page_start = record.get('page_start', 'N/A')
+             page_end = record.get('page_end', 'N/A')
+             page_range = f"{page_start}-{page_end}" if page_start != 'N/A' else 'N/A'
              relevance_table_data.append([
                  chunk_id,
                  record.get('chapter_name', 'N/A'),
-                 relevance_score,
-                 record.get('summary', '')[:100] + "..." # Truncate summary for display
+                 page_range, # Added page range
+                 relevance_score
+                 # Removed summary: record.get('summary', '')[:80] + "..."
              ])
 
-        print("\n--- Summary Relevance Filtering Results ---")
+        print("\n--- Summary Relevance Filtering Results (Relevance & Pages Only) ---") # Updated title
         try:
             print(tabulate(relevance_table_data, headers=headers_relevance, tablefmt="grid"))
         except ImportError:
              print("WARN: 'tabulate' library not found. Skipping table format.")
              for row in relevance_table_data:
-                 print(f"ID: {row[0]}, Chapter: {row[1]}, Relevant: {row[2]}, Summary: {row[3]}")
+                 print(f"ID: {row[0]}, Chapter: {row[1]}, Pages: {row[2]}, Relevant: {row[3]}") # Removed summary
         print(f"Removed {len(all_removed_chunk_ids)} chunks based on summary relevance.")
         print("-" * 80)
-        processed_results = filtered_results # Update results
+        processed_results = filtered_results # Update results for next step
 
-        # --- Stage 3: Section Expansion ---
-        # Modify expand_short_sections to return added IDs
+        # --- Stage 3: Importance Reranking (Moved Earlier) ---
+        # This step calculates 'new_score' but does NOT re-sort the list yet.
+        # Sorting happens at the end based on the calculated 'new_score'.
+        processed_results = rerank_by_importance(processed_results, IMPORTANCE_FACTOR)
+        print("-" * 80)
+
+        # --- Stage 4: Section Expansion ---
+        # Pass the reranked (and sorted) results to expansion
         expanded_results, added_by_expansion_ids = expand_short_sections(
             cursor,
-            processed_results, # Pass filtered results
+            processed_results, # Pass reranked results
             SECTION_EXPANSION_TOP_K_THRESHOLD,
             SECTION_EXPANSION_GENERAL_THRESHOLD,
             SECTION_EXPANSION_EXPANDED_THRESHOLD
@@ -1057,23 +1091,24 @@ def generate_response(query: str):
         print("-" * 80)
         processed_results = expanded_results # Update results
 
-        # --- Stage 4: Gap Filling ---
-        # Modify fill_page_gaps to return added IDs
+        # --- Stage 5: Gap Filling ---
+        # Pass the expanded results to gap filling
         filled_results, added_by_gaps_ids = fill_page_gaps(cursor, processed_results, GAP_FILL_MAX_GAP)
         if not filled_results: return "No results remained after gap filling."
         all_added_chunk_ids.update(added_by_gaps_ids)
         print("-" * 80)
         processed_results = filled_results # Update results
 
-        # --- Stage 5: Importance Reranking ---
-        processed_results = rerank_by_importance(processed_results, IMPORTANCE_FACTOR)
+        # --- Stage 6: Final Sorting ---
+        # Sort by new_score (desc) then by min sequence number (asc) for stability
+        print(f"\n--- Step 6: Sorting {len(processed_results)} final items by new_score (desc) and sequence_number (asc) ---")
+        processed_results.sort(key=lambda x: (
+            x.get('new_score', 0.0) if isinstance(x, dict) else 0.0, # Primary key: score (desc)
+            -get_min_sequence_number(x) # Secondary key: min sequence (asc, negate for reverse sort)
+            ), reverse=True)
+        print(f"Sorting complete.")
         print("-" * 80)
 
-        # --- Stage 6: Final Sorting ---
-        print("\n--- Step 5: Sorting final results by new_score ---")
-        processed_results.sort(key=lambda x: x.get('new_score', 0.0) if isinstance(x, dict) else 0.0, reverse=True)
-        print(f"Sorted {len(processed_results)} final items.")
-        print("-" * 80)
 
         # --- Stage 7: Truncation (Optional) ---
         if FINAL_K is not None and len(processed_results) > FINAL_K:
@@ -1081,7 +1116,7 @@ def generate_response(query: str):
             processed_results = processed_results[:FINAL_K]
             print("-" * 80)
 
-        # --- Stage 7.5: Final Results Summary Log ---
+        # --- Stage 8: Final Results Summary Log ---
         print("\n--- Final Results Summary ---")
         final_chunk_ids = set()
         for item in processed_results:
@@ -1106,11 +1141,11 @@ def generate_response(query: str):
         print("-" * 80)
 
 
-        # --- Stage 8: Format Cards ---
+        # --- Stage 9: Format Cards ---
         formatted_chunks = format_chunks_as_cards(processed_results)
         print("-" * 80)
 
-        # --- Stage 9: Generate Final Response ---
+        # --- Stage 10: Generate Final Response ---
         response_text = generate_response_from_chunks(client, query, formatted_chunks)
 
     except (Exception, psycopg2.DatabaseError) as error:
