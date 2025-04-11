@@ -233,7 +233,7 @@ def perform_vector_search(cursor, query_embedding: list[float], top_k: int, doc_
                 id,
                 sequence_number,
                 content,
-                1 - (embedding <=> %s) AS similarity_score -- Cosine similarity
+                1 - (embedding <=> %s::vector) AS similarity_score -- Cosine similarity
             FROM textbook_chunks
         """
         params = [query_embedding]
