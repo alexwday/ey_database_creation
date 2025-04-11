@@ -262,17 +262,31 @@ def perform_keyword_search(cursor, query: str, top_k: int, doc_id: str | None):
     print(f"\n--- Performing Keyword Search (Top {top_k}) ---")
     results = []
     try:
-        # Use plainto_tsquery for potentially better handling of natural language queries
-        # Use websearch_to_tsquery for more web-like search syntax
-        # Using plainto_tsquery here
-        sql = """
+        # Check if websearch_to_tsquery is available (PostgreSQL 11+)
+        cursor.execute("SELECT 1 FROM pg_proc WHERE proname = 'websearch_to_tsquery'")
+        has_websearch = cursor.fetchone() is not None
+        
+        # Use websearch_to_tsquery if available, fall back to to_tsquery
+        # websearch_to_tsquery handles phrases in quotes, OR/AND operators, and - for negation
+        if has_websearch:
+            print("Using websearch_to_tsquery for more flexible search...")
+            tsquery_func = "websearch_to_tsquery"
+        else:
+            print("Using to_tsquery with OR logic for more matches...")
+            # Convert query to OR-based search by joining terms with |
+            words = query.strip().split()
+            query = ' | '.join(words)
+            tsquery_func = "to_tsquery"
+            
+        # Enhanced ranking with normalization and weights
+        sql = f"""
             SELECT
                 id,
                 sequence_number,
                 content,
-                ts_rank_cd(text_search_vector, plainto_tsquery('english', %s)) AS rank
+                ts_rank_cd(text_search_vector, {tsquery_func}('english', %s), 32) * 10 AS rank
             FROM textbook_chunks
-            WHERE text_search_vector @@ plainto_tsquery('english', %s)
+            WHERE text_search_vector @@ {tsquery_func}('english', %s)
         """
         params = [query, query]
 
@@ -305,6 +319,53 @@ def display_results(search_type: str, results: list, score_field: str):
         print(f"   Content: {str(record['content'])[:200]}...") # Show more preview
 
 # --- Main Execution Function ---
+def check_text_search_setup(cursor):
+    """Verifies the text_search_vector column setup in the database."""
+    print("\n--- Checking Text Search Setup ---")
+    try:
+        # Check if text_search_vector column exists
+        cursor.execute("""
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = 'textbook_chunks' AND column_name = 'text_search_vector';
+        """)
+        column_info = cursor.fetchone()
+        
+        if not column_info:
+            print("WARNING: text_search_vector column not found in textbook_chunks table!")
+            print("To create it, run: ALTER TABLE textbook_chunks ADD COLUMN text_search_vector tsvector;")
+            return False
+            
+        print(f"✅ Found text_search_vector column (type: {column_info[1]})")
+        
+        # Check if the column has data
+        cursor.execute("SELECT COUNT(*) FROM textbook_chunks WHERE text_search_vector IS NOT NULL;")
+        count = cursor.fetchone()[0]
+        print(f"✅ Found {count} rows with non-NULL text_search_vector values")
+        
+        if count == 0:
+            print("WARNING: No text search vectors found. Consider updating with:")
+            print("UPDATE textbook_chunks SET text_search_vector = to_tsvector('english', content);")
+        
+        # Check for index
+        cursor.execute("""
+            SELECT indexname FROM pg_indexes 
+            WHERE tablename = 'textbook_chunks' AND indexdef LIKE '%text_search_vector%';
+        """)
+        index = cursor.fetchone()
+        
+        if not index:
+            print("WARNING: No index found on text_search_vector. Consider creating one with:")
+            print("CREATE INDEX idx_textbook_chunks_tsv ON textbook_chunks USING GIN(text_search_vector);")
+        else:
+            print(f"✅ Found index on text_search_vector: {index[0]}")
+            
+        return True
+        
+    except Exception as e:
+        print(f"ERROR checking text search setup: {e}")
+        return False
+
 def perform_hybrid_search(query=QUERY_STRING):
     """Generates embedding, runs searches, compares results."""
 
@@ -336,6 +397,9 @@ def perform_hybrid_search(query=QUERY_STRING):
     keyword_results = []
     try:
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        # Check the text search setup first
+        check_text_search_setup(cursor)
 
         # 4. Perform Searches
         vector_results = perform_vector_search(cursor, query_embedding, TOP_K, DOCUMENT_ID_TO_SEARCH)
