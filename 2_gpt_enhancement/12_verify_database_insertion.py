@@ -158,19 +158,23 @@ def check_text_search_setup(cursor, doc_id):
     """Verifies the text_search_vector column setup."""
     print(f"\n--- Checking Text Search Setup for document_id='{doc_id}' ---")
     try:
-        # Check if column exists
+        # Check if column exists and if it's a generated column
         cursor.execute("""
-            SELECT column_name, data_type 
-            FROM information_schema.columns 
-            WHERE table_name = 'textbook_chunks' AND column_name = 'text_search_vector';
+            SELECT c.column_name, c.data_type, c.is_generated, c.generation_expression
+            FROM information_schema.columns c
+            WHERE c.table_name = 'textbook_chunks' AND c.column_name = 'text_search_vector';
         """)
         column_info = cursor.fetchone()
         
         if not column_info:
             print("ERROR: text_search_vector column not found in the table!")
             return False
-            
-        print(f"✅ text_search_vector column exists (type: {column_info[1]})")
+        
+        if column_info[2] == 'ALWAYS':
+            print(f"✅ text_search_vector is a GENERATED ALWAYS column (type: {column_info[1]})")
+            print(f"   Generation expression: {column_info[3]}")
+        else:
+            print(f"✅ text_search_vector is a regular column (type: {column_info[1]})")
         
         # Check if vectors are populated for this document
         cursor.execute("""

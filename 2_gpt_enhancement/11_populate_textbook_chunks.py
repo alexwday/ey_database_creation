@@ -226,20 +226,42 @@ def populate_textbook_chunks():
         inserted_count = len(inserted_ids) if inserted_ids else cursor.rowcount
         print(f"Successfully inserted {inserted_count} records.")
         
-        # 4. Update text_search_vector for the inserted records
-        print("Updating text_search_vector for full-text search capabilities...")
-        update_sql = """
-            UPDATE textbook_chunks 
-            SET text_search_vector = to_tsvector('english', 
-                COALESCE(content, '') || ' ' || 
-                COALESCE(section_title, '') || ' ' || 
-                COALESCE(chapter_name, '')
-            )
-            WHERE document_id = %s;
-        """
-        cursor.execute(update_sql, (DOCUMENT_ID_TO_REPLACE,))
-        updated_count = cursor.rowcount
-        print(f"Updated text_search_vector for {updated_count} records.")
+        # 4. Check if text_search_vector is a generated column
+        print("Checking if text_search_vector needs manual updating...")
+        cursor.execute("""
+            SELECT generation_expression 
+            FROM information_schema.columns 
+            WHERE table_name = 'textbook_chunks' 
+            AND column_name = 'text_search_vector' 
+            AND is_generated = 'ALWAYS';
+        """)
+        is_generated = cursor.fetchone()
+        
+        if is_generated:
+            # If it's a generated column, it updates automatically - no need to do anything
+            print(f"✅ text_search_vector is a generated column with expression: {is_generated[0]}")
+            print("  No manual update needed - values are generated automatically")
+        else:
+            # If it's a regular column, we need to update it manually
+            print("Updating text_search_vector for full-text search capabilities...")
+            try:
+                update_sql = """
+                    UPDATE textbook_chunks 
+                    SET text_search_vector = to_tsvector('english', 
+                        COALESCE(content, '') || ' ' || 
+                        COALESCE(section_title, '') || ' ' || 
+                        COALESCE(chapter_name, '')
+                    )
+                    WHERE document_id = %s;
+                """
+                cursor.execute(update_sql, (DOCUMENT_ID_TO_REPLACE,))
+                updated_count = cursor.rowcount
+                print(f"Updated text_search_vector for {updated_count} records.")
+            except Exception as e:
+                # If update fails, warn but continue - it might be a generated column with different settings
+                print(f"WARNING: Could not update text_search_vector manually: {e}")
+                print("  This is expected if the column is managed by a trigger or is a generated column")
+                print("  The database might be handling text search vectors automatically")
         
         # 5. Ensure text search index exists
         print("Checking if text search index exists...")
