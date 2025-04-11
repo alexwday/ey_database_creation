@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Phase 3H: Hybrid Search Assessment
+Phase 3H: Response Generation from Retrieved Chunks
 
-Goal: Evaluate retrieval quality for hybrid search by sending chunks to GPT
-for relevance assessment. Uses OAuth/SSL connection method for API calls.
-Compares vector and keyword search results with a relevance score from GPT.
+Goal: Format retrieved chunks as "cards" and provide them to GPT 
+to generate a comprehensive response that cites specific chapters and sections.
 
 For use in Jupyter notebook cells.
 
@@ -33,10 +32,14 @@ from pgvector.psycopg2 import register_vector
 # --- Configuration ---
 # Source document ID to search within (optional, set to None to search all)
 DOCUMENT_ID_TO_SEARCH = "ey_international_gaap_2024"
-# Number of results to retrieve for each search type
-TOP_K = 3
-# API model for relevance judgments
-JUDGE_MODEL = "gpt-4o"
+# Number of results to retrieve for search
+TOP_K = 10
+# API model for response generation
+RESPONSE_MODEL = "gpt-4o"
+# Maximum tokens for the response
+MAX_RESPONSE_TOKENS = 4000
+# Temperature for response generation
+RESPONSE_TEMPERATURE = 0.7
 
 # --- Embedding Configuration ---
 EMBEDDING_MODEL = "text-embedding-3-large"
@@ -215,263 +218,264 @@ def generate_query_embedding(client, query: str, model: str, dimensions: int) ->
 
 # --- Search Functions ---
 
-def perform_vector_search(cursor, query_embedding: list[float], top_k: int, doc_id: str | None):
-    """Performs vector similarity search using cosine distance."""
-    print(f"\n--- Performing Vector Similarity Search (Top {top_k}) ---")
+def perform_hybrid_search(cursor, query: str, query_embedding: list[float], top_k: int, doc_id: str | None):
+    """
+    Performs hybrid search combining vector similarity and keyword search.
+    Returns a combined ranked list of results.
+    """
+    print(f"\n--- Performing Hybrid Search (Top {top_k}) ---")
     results = []
+    
     if query_embedding is None:
-        print("ERROR: Cannot perform vector search without query embedding.", file=sys.stderr)
+        print("ERROR: Cannot perform vector component of hybrid search without embedding.", file=sys.stderr)
         return results
 
     try:
-        sql = """
-            SELECT
-                id,
-                sequence_number,
-                content,
-                chapter_name,
-                section_title,
-                1 - (embedding <=> %s::vector) AS similarity_score -- Cosine similarity
-            FROM textbook_chunks
-        """
-        params = [query_embedding]
-
-        if doc_id:
-            sql += " WHERE document_id = %s"
-            params.append(doc_id)
-
-        sql += " ORDER BY similarity_score DESC LIMIT %s;"
-        params.append(top_k)
-
-        cursor.execute(sql, params)
-        results = cursor.fetchall()
-        print(f"Found {len(results)} results via vector search.")
-
-    except Exception as e:
-        print(f"ERROR: Vector search failed: {e}", file=sys.stderr)
-        if "operator does not exist" in str(e):
-             print("HINT: Ensure the 'pgvector' extension is installed and enabled in your database (`CREATE EXTENSION IF NOT EXISTS vector;`).", file=sys.stderr)
-        traceback.print_exc()
-
-    return results
-
-def perform_keyword_search(cursor, query: str, top_k: int, doc_id: str | None):
-    """Performs full-text keyword search."""
-    print(f"\n--- Performing Keyword Search (Top {top_k}) ---")
-    results = []
-    try:
-        # Extract words, filter out very short ones that could be noise
-        words = [w for w in query.strip().split() if len(w) > 2]
-        
-        if not words:
-            print("Warning: Query contains no usable keywords after filtering.")
-            words = query.strip().split()  # Use all words if filtering removed everything
-            
-        # Create OR-based query to find documents with ANY of the keywords
-        or_query = ' | '.join(words)
-        print(f"Searching for documents containing any of these terms: {or_query}")
-            
         # Check if websearch_to_tsquery is available (PostgreSQL 11+)
         cursor.execute("SELECT 1 FROM pg_proc WHERE proname = 'websearch_to_tsquery'")
         has_websearch = cursor.fetchone() is not None
         
         # Use websearch_to_tsquery if available, fall back to to_tsquery
         if has_websearch:
-            print("Using websearch_to_tsquery for more flexible search...")
+            print("Using websearch_to_tsquery for keyword component...")
             tsquery_func = "websearch_to_tsquery"
             # Keep original query for websearch_to_tsquery as it handles operators
             search_query = query
         else:
-            print("Using to_tsquery with OR logic...")
+            print("Using to_tsquery for keyword component...")
             tsquery_func = "to_tsquery"
-            # Use our OR-based query for to_tsquery
-            search_query = or_query
-            
-        # Enhanced ranking with combined normalization:
-        # - 2: Normalize by document length (fair comparison between short/long chunks)
-        # - 32: Compress scores between 0-1 to avoid extreme values
-        # Multiply by 10 for more readable scores
+            # Extract words, filter out very short ones
+            words = [w for w in query.strip().split() if len(w) > 2]
+            if not words:
+                words = query.strip().split()  # Use all words if filtering removed everything
+            # Create OR-based query to find documents with ANY of the keywords
+            search_query = ' | '.join(words)
+            print(f"Using OR-based query: {search_query}")
+
+        # Hybrid search SQL combining vector and keyword components
+        # Weighting: 0.7 for vector similarity, 0.3 for text search relevance
+        # This ratio can be adjusted based on your requirements
         sql = f"""
-            SELECT
-                id,
-                sequence_number,
-                content,
-                chapter_name,
-                section_title,
-                ts_rank_cd(text_search_vector, {tsquery_func}('english', %s), 2|32) * 10 AS rank,
-                LENGTH(content) AS content_length
-            FROM textbook_chunks
-            WHERE text_search_vector @@ {tsquery_func}('english', %s)
+            WITH vector_results AS (
+                SELECT 
+                    id,
+                    1 - (embedding <=> %s::vector) AS vector_score
+                FROM textbook_chunks
+                WHERE 1=1
+                {" AND document_id = %s" if doc_id else ""}
+            ),
+            text_results AS (
+                SELECT 
+                    id,
+                    ts_rank_cd(text_search_vector, {tsquery_func}('english', %s), 2|32) * 10 AS text_score
+                FROM textbook_chunks
+                WHERE text_search_vector @@ {tsquery_func}('english', %s)
+                {" AND document_id = %s" if doc_id else ""}
+            ),
+            combined_results AS (
+                SELECT 
+                    c.id,
+                    c.sequence_number,
+                    c.document_id,
+                    c.chapter_number,
+                    c.chapter_name,
+                    c.section_number,
+                    c.section_title,
+                    c.content,
+                    c.standard,
+                    c.standard_codes,
+                    c.tags,
+                    COALESCE(v.vector_score, 0) AS vector_score,
+                    COALESCE(t.text_score, 0) AS text_score,
+                    (COALESCE(v.vector_score, 0) * 0.7) + (COALESCE(t.text_score, 0) * 0.3) AS combined_score
+                FROM textbook_chunks c
+                LEFT JOIN vector_results v ON c.id = v.id
+                LEFT JOIN text_results t ON c.id = t.id
+                WHERE COALESCE(v.vector_score, 0) > 0 OR COALESCE(t.text_score, 0) > 0
+            )
+            SELECT * FROM combined_results
+            ORDER BY combined_score DESC
+            LIMIT %s;
         """
-        params = [search_query, search_query]
-
+        
+        # Prepare parameters
+        params = [query_embedding, search_query, search_query, top_k]
         if doc_id:
-            sql += " AND document_id = %s"
-            params.append(doc_id)
-
-        sql += " ORDER BY rank DESC LIMIT %s;"
-        params.append(top_k)
-
+            # Insert document_id parameter for both vector and text queries
+            params = [query_embedding, doc_id, search_query, search_query, doc_id, top_k]
+        
         cursor.execute(sql, params)
         results = cursor.fetchall()
-        print(f"Found {len(results)} results via keyword search.")
+        print(f"Found {len(results)} results via hybrid search.")
 
     except Exception as e:
-        print(f"ERROR: Keyword search failed: {e}", file=sys.stderr)
+        print(f"ERROR: Hybrid search failed: {e}", file=sys.stderr)
         traceback.print_exc()
 
     return results
 
-def evaluate_chunk_relevance(client, query, chunk_content, chunk_info):
-    """
-    Send chunk to GPT for relevance assessment.
-    Returns structured assessment data.
-    """
-    system_message = """
-    You are an expert system evaluating search retrieval quality. 
-    Your task is to judge how relevant a retrieved text chunk is to a search query.
-    Give an honest, critical assessment of whether this chunk actually answers the query.
-    
-    Rate relevance on a scale of 1-10 where:
-    - 1-3: Not relevant or marginally relevant
-    - 4-6: Somewhat relevant but incomplete
-    - 7-10: Very relevant, directly answers the query
-    
-    Provide your assessment in JSON format with these fields:
-    - relevance_score: Numeric score (1-10)
-    - analysis: Brief explanation of your scoring (1-2 sentences)
-    - key_points: List of 1-3 key points from the chunk relevant to the query
-    - missing_info: What important information is missing (if any)
-    """
-    
-    user_message = f"""
-    Query: {query}
-    
-    Retrieved Chunk Information:
-    ID: {chunk_info.get('id')}
-    Chapter: {chunk_info.get('chapter_name', 'N/A')}
-    Section: {chunk_info.get('section_title', 'N/A')}
-    
-    Chunk Content:
-    {chunk_content}
-    
-    Provide your assessment in JSON format.
-    """
-    
-    try:
-        response = client.chat.completions.create(
-            model=JUDGE_MODEL,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=0.3
-        )
-        
-        # Extract and parse JSON response
-        response_text = response.choices[0].message.content
-        return json.loads(response_text)
-    
-    except Exception as e:
-        print(f"ERROR: Chunk evaluation failed: {e}", file=sys.stderr)
-        return {
-            "relevance_score": 0,
-            "analysis": f"Error evaluating chunk: {str(e)[:100]}",
-            "key_points": [],
-            "missing_info": "Evaluation failed"
-        }
+# --- Response Generation Functions ---
 
-def assess_search_results(client, query, results, search_type):
-    """Assess all results from a search method."""
-    print(f"\n--- Assessing {search_type} Results ---")
+def format_chunks_as_cards(results):
+    """
+    Formats database results into "cards" for better GPT context understanding.
     
-    assessed_results = []
+    Args:
+        results: List of database result rows (as dict cursors)
+    
+    Returns:
+        Formatted string with all chunks as cards
+    """
+    cards = []
     
     for i, record in enumerate(results):
-        print(f"\nEvaluating {search_type} result #{i+1} (ID: {record['id']})...")
+        card_parts = [f"--- CARD {i+1} ---"]
         
-        # Prepare info for assessment
-        chunk_info = {
-            "id": record['id'],
-            "chapter_name": record.get('chapter_name', 'Unknown Chapter'),
-            "section_title": record.get('section_title', 'Unknown Section'),
-            "sequence_number": record['sequence_number']
-        }
+        # Card metadata
+        chapter_name = record.get('chapter_name', 'Unknown Chapter')
+        chapter_number = record.get('chapter_number', 'Unknown')
+        section_title = record.get('section_title', 'Unknown Section')
+        section_number = record.get('section_number', 'Unknown')
         
-        # Get score based on search type
-        if search_type == "Vector":
-            search_score = float(record['similarity_score'])
-            score_label = "similarity_score"
-        else:
-            search_score = float(record['rank'])
-            score_label = "rank"
+        card_parts.append(f"Chapter {chapter_number}: {chapter_name}")
+        card_parts.append(f"Section {section_number}: {section_title}")
         
-        # Evaluate chunk
-        assessment = evaluate_chunk_relevance(client, query, record['content'], chunk_info)
+        # Add standard information if available
+        standard = record.get('standard')
+        if standard:
+            card_parts.append(f"Standard: {standard}")
         
-        # Store results
-        result_data = {
-            "chunk_info": chunk_info,
-            "search_score": search_score,
-            "score_label": score_label,
-            "assessment": assessment,
-            "content_preview": str(record['content'])[:150] + "..."
-        }
+        standard_codes = record.get('standard_codes')
+        if standard_codes and isinstance(standard_codes, list) and standard_codes:
+            card_parts.append(f"Standard Codes: {', '.join(standard_codes)}")
         
-        assessed_results.append(result_data)
+        tags = record.get('tags')
+        if tags and isinstance(tags, list) and tags:
+            card_parts.append(f"Tags: {', '.join(tags)}")
         
-        # Display assessment summary
-        print(f"  Search Score ({score_label}): {search_score:.6f}")
-        print(f"  Relevance Score: {assessment['relevance_score']}/10")
-        print(f"  Analysis: {assessment['analysis']}")
+        # Add search scores for reference
+        vector_score = record.get('vector_score', 0)
+        text_score = record.get('text_score', 0)
+        combined_score = record.get('combined_score', 0)
+        card_parts.append(f"Relevance Scores: Vector={vector_score:.4f}, Text={text_score:.4f}, Combined={combined_score:.4f}")
+        
+        # Add content
+        content = record.get('content', '')
+        card_parts.append("\nCONTENT:")
+        card_parts.append(content)
+        
+        cards.append("\n".join(card_parts))
     
-    return assessed_results
+    # Join all cards with clear separation
+    return "\n\n" + "\n\n".join(cards) + "\n\n"
 
-def display_assessment_results(assessed_results, search_type):
-    """Display assessment results in a clean format."""
-    print(f"\n{'='*80}")
-    print(f"ASSESSMENT SUMMARY: {search_type.upper()} SEARCH")
-    print(f"{'='*80}")
+def generate_response_from_chunks(client, query, formatted_chunks):
+    """
+    Generates a GPT response based on the query and formatted chunks.
     
-    for i, result in enumerate(assessed_results):
-        chunk_info = result["chunk_info"]
-        assessment = result["assessment"]
-        
-        print(f"\n{search_type} Result #{i+1}:")
-        print(f"  ID: {chunk_info['id']}, Seq: {chunk_info['sequence_number']}")
-        print(f"  Location: {chunk_info.get('chapter_name', 'Unknown')} > {chunk_info.get('section_title', 'Unknown')}")
-        print(f"  {search_type} Score: {result['search_score']:.6f}")
-        print(f"  Relevance Score: {assessment['relevance_score']}/10")
-        print(f"  Analysis: {assessment['analysis']}")
-        
-        if assessment.get('key_points'):
-            print("  Key Points:")
-            for point in assessment['key_points']:
-                print(f"    • {point}")
+    Args:
+        client: OpenAI client
+        query: User's query/question
+        formatted_chunks: Chunks formatted as cards
+    
+    Returns:
+        Generated response from GPT
+    """
+    print("\n--- Generating Response from Retrieved Chunks ---")
+    
+    system_message = """You are a specialized accounting research assistant with expertise in IFRS and US GAAP standards.
+Your task is to answer accounting questions based ONLY on the information provided in the context cards.
+You must NEVER use information from your training data - rely exclusively on the cards provided.
+
+When answering:
+1. Be thorough, accurate and precise, focusing only on accounting/financial reporting relevance.
+2. You MUST cite specific chapters and sections that contain your information using the format: [Chapter X, Section Y] for each point.
+3. If multiple cards provide supporting information for a point, cite all relevant sources.
+4. Do not fabricate information - if the provided cards don't contain sufficient information, acknowledge the limitations.
+5. Structure your response with clear headings if appropriate.
+6. Provide a concise summary at the end (2-3 sentences).
+
+Remember: Every significant point you make MUST include chapter and section references."""
+
+    user_message = f"""Question: {query}
+
+Below are the reference cards that contain information to answer this question. Use ONLY this information, not your training data.
+
+{formatted_chunks}
+
+Please provide a comprehensive answer with proper chapter and section citations for each point."""
+
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_message}
+    ]
+    
+    try:
+        # Make API call
+        last_exception = None
+        for attempt in range(_RETRY_ATTEMPTS):
+            try:
+                print(f"Making API call for response generation (Attempt {attempt + 1}/{_RETRY_ATTEMPTS})...")
                 
-        if assessment.get('missing_info') and assessment['missing_info'] != "None":
-            print(f"  Missing Information: {assessment['missing_info']}")
-            
-        print(f"  Preview: {result['content_preview']}")
+                response = client.chat.completions.create(
+                    model=RESPONSE_MODEL,
+                    messages=messages,
+                    max_tokens=MAX_RESPONSE_TOKENS,
+                    temperature=RESPONSE_TEMPERATURE,
+                    stream=False
+                )
+                
+                print("API call for response generation successful.")
+                response_content = response.choices[0].message.content
+                
+                # Print token usage information
+                usage_info = response.usage
+                if usage_info:
+                    print(f"Token Usage - Prompt: {usage_info.prompt_tokens}, Completion: {usage_info.completion_tokens}, Total: {usage_info.total_tokens}")
+                
+                return response_content
+                
+            except APIError as e:
+                print(f"API Error on attempt {attempt + 1}: {e}", file=sys.stderr)
+                last_exception = e
+                time.sleep(_RETRY_DELAY * (attempt + 1))
+            except Exception as e:
+                print(f"Non-API Error on attempt {attempt + 1}: {e}", file=sys.stderr)
+                last_exception = e
+                time.sleep(_RETRY_DELAY)
+        
+        # If we get here, all attempts failed
+        error_msg = f"ERROR: Failed to generate response after {_RETRY_ATTEMPTS} attempts."
+        if last_exception:
+            error_msg += f" Last error: {str(last_exception)}"
+        print(error_msg, file=sys.stderr)
+        return f"Error generating response: {error_msg}"
     
-    # Calculate average relevance
-    avg_relevance = sum(r['assessment']['relevance_score'] for r in assessed_results) / len(assessed_results) if assessed_results else 0
-    print(f"\nAverage Relevance Score: {avg_relevance:.2f}/10")
+    except Exception as e:
+        print(f"ERROR: Unexpected error during response generation: {e}", file=sys.stderr)
+        traceback.print_exc()
+        return f"Error generating response: {str(e)}"
 
-def evaluate_hybrid_search(query):
+# --- Main Function ---
+
+def generate_response(query):
     """
-    Main function to run search, assess relevance, and display results.
+    Main function to retrieve chunks and generate a response.
     Can be called directly from a Jupyter notebook cell.
+    
+    Args:
+        query: User's query/question
+    
+    Returns:
+        Generated response from GPT based on retrieved chunks
     """
-    print(f"--- Starting Hybrid Search Assessment ---")
+    print(f"--- Starting Response Generation Process ---")
     print(f"Query: '{query}'")
 
     # 1. Create OpenAI Client (using OAuth/SSL method)
     client = create_openai_client()
     if not client:
-        print("ERROR: Failed to create OpenAI client. Cannot proceed.", file=sys.stderr)
-        raise RuntimeError("OpenAI client initialization failed.")
+        return "ERROR: Failed to create OpenAI client. Cannot proceed with response generation."
 
     # 2. Generate Query Embedding
     query_embedding = generate_query_embedding(
@@ -481,49 +485,44 @@ def evaluate_hybrid_search(query):
         dimensions=EMBEDDING_DIMENSIONS
     )
     if query_embedding is None:
-        print("ERROR: Failed to generate query embedding. Aborting search.", file=sys.stderr)
-        raise RuntimeError("Query embedding generation failed.")
+        return "ERROR: Failed to generate query embedding. Cannot perform vector search component."
 
     # 3. Connect to Database
     conn = connect_to_db(DB_PARAMS)
     if conn is None:
-        print("Aborting due to database connection failure.", file=sys.stderr)
-        raise RuntimeError("Database connection failed.")
+        return "ERROR: Database connection failed. Cannot retrieve chunks for response generation."
 
+    response_text = None
     cursor = None
     try:
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # 4. Perform Searches
-        vector_results = perform_vector_search(cursor, query_embedding, TOP_K, DOCUMENT_ID_TO_SEARCH)
-        keyword_results = perform_keyword_search(cursor, query, TOP_K, DOCUMENT_ID_TO_SEARCH)
-
-        # 5. Assess Relevance of Search Results
-        vector_assessments = assess_search_results(client, query, vector_results, "Vector")
-        keyword_assessments = assess_search_results(client, query, keyword_results, "Keyword")
+        # 4. Perform Hybrid Search to retrieve relevant chunks
+        search_results = perform_hybrid_search(
+            cursor=cursor,
+            query=query,
+            query_embedding=query_embedding,
+            top_k=TOP_K,
+            doc_id=DOCUMENT_ID_TO_SEARCH
+        )
         
-        # 6. Display Assessment Results
-        display_assessment_results(vector_assessments, "Vector")
-        display_assessment_results(keyword_assessments, "Keyword")
+        if not search_results:
+            return "No relevant information found for your query in the database."
         
-        # 7. Compare Overall Performance
-        vector_avg = sum(r['assessment']['relevance_score'] for r in vector_assessments) / len(vector_assessments) if vector_assessments else 0
-        keyword_avg = sum(r['assessment']['relevance_score'] for r in keyword_assessments) / len(keyword_assessments) if keyword_assessments else 0
+        # 5. Format chunks as cards
+        formatted_chunks = format_chunks_as_cards(search_results)
         
-        print("\n\n--- OVERALL COMPARISON ---")
-        print(f"Vector Search Average Relevance: {vector_avg:.2f}/10")
-        print(f"Keyword Search Average Relevance: {keyword_avg:.2f}/10")
-        
-        if vector_avg > keyword_avg:
-            print(f"Vector search performed better by {vector_avg - keyword_avg:.2f} points")
-        elif keyword_avg > vector_avg:
-            print(f"Keyword search performed better by {keyword_avg - vector_avg:.2f} points")
-        else:
-            print("Both search methods performed equally")
+        # 6. Generate response from chunks
+        response_text = generate_response_from_chunks(
+            client=client,
+            query=query,
+            formatted_chunks=formatted_chunks
+        )
 
     except (Exception, psycopg2.DatabaseError) as error:
-        print(f"ERROR: Assessment failed: {error}", file=sys.stderr)
+        print(f"ERROR: Response generation process failed: {error}", file=sys.stderr)
         traceback.print_exc()
+        response_text = f"Error during response generation process: {str(error)}"
     finally:
         if cursor:
             cursor.close()
@@ -531,13 +530,9 @@ def evaluate_hybrid_search(query):
             conn.close()
             print("\nDatabase connection closed.")
 
-    print("\n--- Hybrid Search Assessment Finished ---")
-    
-    # Return the performance metrics for potential further analysis
-    return {
-        "vector_avg": vector_avg if 'vector_avg' in locals() else 0,
-        "keyword_avg": keyword_avg if 'keyword_avg' in locals() else 0,
-    }
+    print("\n--- Response Generation Process Finished ---")
+    return response_text
 
 # Example of how to use in a Jupyter notebook cell:
-# evaluate_hybrid_search("Explain the accounting treatment for leases under IFRS 16")
+# response = generate_response("Explain the accounting treatment for leases under IFRS 16")
+# print(response)
