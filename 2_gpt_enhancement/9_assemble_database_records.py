@@ -393,7 +393,8 @@ else:
 
                     # FILTER FIELDS
                     "document_id": "ey_international_gaap_2024", # Hardcoded as requested
-                    "chapter_name": chunk.get("chapter_name", f"Chapter {chapter_num}"), # Use correct field 'chapter_name'
+                    # Format chapter_name as chapter_{num}_{name}
+                    "chapter_name": f"chapter_{str(chapter_num).zfill(2)}_{chunk.get('chapter_name', '')}",
                     "tags": chapter_tags,
                     "standard": section_standard,
                     "standard_codes": section_standard_codes,
