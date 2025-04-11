@@ -138,41 +138,49 @@ def create_openai_client(base_url=BASE_URL):
         # traceback.print_exc() # Optional
         return None
 
-def _call_embedding_api_with_retry(client, text_input, model, dimensions):
-    """Calls the OpenAI embedding API with retry logic."""
+def _call_embedding_api_with_retry(client, text_inputs: list[str], model: str, dimensions: int) -> list | None:
+    """Calls the OpenAI embedding API with a batch of texts and retry logic."""
     last_exception = None
-    if not text_input: # Handle empty input case
-        print("WARNING: Empty text input received for embedding. Returning None.")
+    if not text_inputs:
+        print("WARNING: Empty batch received for embedding. Returning None.")
         return None
+    # Ensure all inputs are strings and non-empty, replace empty strings if necessary
+    processed_inputs = [text if text else " " for text in text_inputs]
+
 
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            # print(f"DEBUG: Calling embedding API (Attempt {attempt + 1}/{_RETRY_ATTEMPTS})...") # Optional debug
+            # print(f"DEBUG: Calling embedding API for batch size {len(processed_inputs)} (Attempt {attempt + 1}/{_RETRY_ATTEMPTS})...") # Optional debug
             response = client.embeddings.create(
-                input=[text_input], # API expects a list of strings
+                input=processed_inputs, # Send the batch of texts
                 model=model,
                 dimensions=dimensions
             )
-            # Extract the embedding vector
-            if response.data and len(response.data) > 0 and response.data[0].embedding:
-                return response.data[0].embedding
+            # Extract the list of embedding vectors
+            if response.data and len(response.data) == len(processed_inputs):
+                # Return list of embeddings, preserving order
+                return [item.embedding for item in response.data]
             else:
-                raise ValueError("Invalid response structure received from embedding API.")
+                # This case might happen if the API returns fewer embeddings than inputs, which is unexpected.
+                print(f"ERROR: Embedding API returned {len(response.data)} embeddings for {len(processed_inputs)} inputs.")
+                raise ValueError("Mismatch between input batch size and embedding response size.")
 
         except APIError as e:
-            print(f"WARNING: API Error on embedding attempt {attempt + 1}: {e}") # Use print
+            print(f"WARNING: API Error on embedding batch attempt {attempt + 1}: {e}") # Use print
             last_exception = e
-            time.sleep(_RETRY_DELAY * (attempt + 1))
+            # Consider different delays for different errors (e.g., rate limits)
+            delay = _RETRY_DELAY * (attempt + 1)
+            print(f"Retrying in {delay} seconds...")
+            time.sleep(delay)
         except Exception as e:
-            print(f"WARNING: Non-API Error on embedding attempt {attempt + 1}: {e}") # Use print
+            print(f"WARNING: Non-API Error on embedding batch attempt {attempt + 1}: {e}") # Use print
             last_exception = e
             # traceback.print_exc() # Optional
-            time.sleep(_RETRY_DELAY) # Shorter delay for non-API errors
+            delay = _RETRY_DELAY # Shorter delay for non-API errors
+            print(f"Retrying in {delay} seconds...")
+            time.sleep(delay)
 
-    print(f"ERROR: Embedding API call failed after {_RETRY_ATTEMPTS} attempts for input: {text_input[:100]}...") # Use print
-    # Optionally raise the last exception or return None
-    # if last_exception:
-    #     raise last_exception
+    print(f"ERROR: Embedding API call failed after {_RETRY_ATTEMPTS} attempts for batch starting with: {processed_inputs[0][:100]}...") # Use print
     return None
 
 
@@ -225,38 +233,55 @@ if records is not None and client is not None:
     print(f"Generating embeddings for {len(records)} records using model '{EMBEDDING_MODEL}' with {EMBEDDING_DIMENSIONS} dimensions...") # Use print
     embeddings_generated = 0
     embeddings_failed = 0
+    BATCH_SIZE = 50 # Process records in batches of 50
 
-    # Use tqdm.notebook here
-    for record in tqdm(records, desc="Generating Embeddings"):
+    print(f"Generating embeddings for {len(records)} records using model '{EMBEDDING_MODEL}' with {EMBEDDING_DIMENSIONS} dimensions (Batch Size: {BATCH_SIZE})...") # Use print
+
+    # Process in batches
+    for i in tqdm(range(0, len(records), BATCH_SIZE), desc="Generating Embeddings Batches"):
+        batch_records = records[i:i + BATCH_SIZE]
+        batch_texts = [record.get('content', '') for record in batch_records] # Get content, default to empty string
+
+        # Check if all texts in batch are empty before calling API
+        if not any(batch_texts):
+             print(f"WARNING: Batch {i//BATCH_SIZE + 1} contains only empty content. Skipping API call.")
+             for record in batch_records:
+                 record['embedding'] = None
+                 embeddings_failed += 1
+             continue
+
         try:
-            content_to_embed = record.get('content')
-            if content_to_embed:
-                embedding_vector = _call_embedding_api_with_retry(
-                    client=client,
-                    text_input=content_to_embed,
-                    model=EMBEDDING_MODEL,
-                    dimensions=EMBEDDING_DIMENSIONS
-                )
-                if embedding_vector:
-                    record['embedding'] = embedding_vector
-                    embeddings_generated += 1
-                else:
-                    # Error already printed in helper function
-                    record['embedding'] = None # Ensure field exists but is None on failure
-                    embeddings_failed += 1
+            embedding_vectors = _call_embedding_api_with_retry(
+                client=client,
+                text_inputs=batch_texts,
+                model=EMBEDDING_MODEL,
+                dimensions=EMBEDDING_DIMENSIONS
+            )
+
+            if embedding_vectors and len(embedding_vectors) == len(batch_records):
+                # Assign embeddings back to the records in the batch
+                for record, vector in zip(batch_records, embedding_vectors):
+                    record['embedding'] = vector
+                embeddings_generated += len(batch_records)
             else:
-                print(f"WARNING: Record with sequence_number {record.get('sequence_number', 'N/A')} has no 'content'. Skipping embedding.") # Use print
-                record['embedding'] = None # Ensure field exists but is None
-                embeddings_failed += 1 # Count as failed if content is missing
+                # Handle case where API call failed or returned unexpected results for the batch
+                print(f"ERROR: Failed to get embeddings for batch starting at index {i}. Setting embeddings to None for this batch.")
+                for record in batch_records:
+                    record['embedding'] = None
+                embeddings_failed += len(batch_records)
 
         except Exception as e:
-            print(f"ERROR: Unexpected error processing record with sequence_number {record.get('sequence_number', 'N/A')}: {e}") # Use print
+            # Catch any unexpected errors during batch processing
+            print(f"ERROR: Unexpected error processing batch starting at index {i}: {e}") # Use print
             # traceback.print_exc() # Optional
-            record['embedding'] = None # Ensure field exists but is None on error
-            embeddings_failed += 1
+            for record in batch_records:
+                record['embedding'] = None # Ensure field exists but is None on error
+            embeddings_failed += len(batch_records)
+
 
     print(f"Finished generating embeddings.") # Use print
-    print(f"  Successfully generated: {embeddings_generated}")
+    print(f"  Total Records Processed: {len(records)}")
+    print(f"  Embeddings Successfully Generated: {embeddings_generated}")
     print(f"  Failed/Skipped: {embeddings_failed}")
 
     # 6. Save Final Output
