@@ -30,6 +30,7 @@ from openai import OpenAI, APIError, RateLimitError, APITimeoutError
 from pgvector.psycopg2 import register_vector
 import json # For parsing GPT relevance response
 import itertools # For grouping in gap filling
+from tabulate import tabulate # For better table printing
 
 # --- Configuration ---
 # --- Search & Reranking Configuration ---
@@ -435,18 +436,25 @@ Provide your response as a single JSON object mapping each ID to 1 (relevant) or
             print(f"  - Filtering out chunk ID {chunk_id} (summary deemed irrelevant).")
 
     print(f"Finished summary filtering. Kept {len(filtered_results)} results, removed {removed_count}.")
-    return filtered_results
+    # Return both the filtered list and the map for logging
+    return filtered_results, relevance_map
 
 
-def expand_short_sections(cursor, results: list[dict], top_k_threshold: int, general_threshold: int, expanded_threshold: int) -> list[dict | list[dict]]:
+def expand_short_sections(cursor, results: list[dict], top_k_threshold: int, general_threshold: int, expanded_threshold: int) -> tuple[list[dict | list[dict]], set]:
     """
     Expands chunks belonging to short sections by fetching all chunks for that section.
-    Returns a list where expanded sections are represented as lists of chunk dicts.
+    Returns a tuple containing:
+    - The processed list (with groups for expanded sections).
+    - A set of chunk IDs that were added during expansion (excluding the original triggering chunk).
     """
     print(f"\n--- Step 2: Expanding short sections (Gen Threshold: {general_threshold}pg, Exp Threshold: {expanded_threshold}pg for Top {top_k_threshold} or multi-chunk) ---")
-    if not results: return []
+    if not results: return [], set()
 
     processed_results = []
+    expansion_log_data = []
+    headers_expansion = ["Orig Chunk ID", "Rank", "Section Pages", "Threshold", "Action", "Added Chunks"]
+    added_chunk_ids = set() # Track IDs added by this step
+
     # Identify sections already present more than once
     section_keys = set()
     multi_chunk_sections = set()
@@ -457,37 +465,48 @@ def expand_short_sections(cursor, results: list[dict], top_k_threshold: int, gen
         section_keys.add(key)
 
     # Keep track of sections we've already expanded to avoid redundant DB calls
-    expanded_sections = set()
+    expanded_sections = set() # Store section_key tuples
+    original_chunk_ids_in_results = {r.get('id') for r in results if isinstance(r, dict)} # IDs before expansion
 
     for record in results:
+        orig_chunk_id = record.get('id')
         doc_id = record.get('document_id')
         chapter = record.get('chapter_name')
         hierarchy = record.get('section_hierarchy')
         page_start = record.get('page_start')
         page_end = record.get('page_end')
-        rank = record.get('rank') # Assumes rank was added previously
+        rank = record.get('rank')
         section_key = (doc_id, chapter, hierarchy)
+
+        log_row = [orig_chunk_id or "N/A", rank or "N/A", "N/A", "N/A", "Keep Single", 0] # Default log row
 
         # Skip if this section has already been fully added by a previous expansion
         if section_key in expanded_sections:
+            # If the *original* chunk is being processed again after its section was expanded, skip it.
+            # This prevents adding the single chunk back after the group was added.
+            # We don't log this skip action as it's internal cleanup.
             continue
 
         # Determine if expansion is needed
         should_expand = False
+        section_length = "N/A"
+        threshold = "N/A"
         if page_start is not None and page_end is not None and rank is not None:
             section_length = page_end - page_start + 1
+            log_row[2] = section_length
             # Determine threshold: expanded if rank is low OR section appears multiple times
             threshold = expanded_threshold if (rank <= top_k_threshold or section_key in multi_chunk_sections) else general_threshold
+            log_row[3] = threshold
 
             if section_length <= threshold:
                 should_expand = True
-                print(f"  - Section '{hierarchy}' (Rank {rank}, Len {section_length}pg) meets threshold ({threshold}pg). Checking for expansion.")
+                # print(f"  - Section '{hierarchy}' (Rank {rank}, Len {section_length}pg) meets threshold ({threshold}pg). Checking for expansion.") # Replaced by table log
             # else:
-            #     print(f"  - Section '{hierarchy}' (Rank {rank}, Len {section_length}pg) exceeds threshold ({threshold}pg). Keeping single chunk.")
+                 # print(f"  - Section '{hierarchy}' (Rank {rank}, Len {section_length}pg) exceeds threshold ({threshold}pg). Keeping single chunk.") # Replaced by table log
 
         if should_expand:
             try:
-                print(f"    Fetching all chunks for section: Doc='{doc_id}', Chapter='{chapter}', Hierarchy='{hierarchy}'")
+                # print(f"    Fetching all chunks for section: Doc='{doc_id}', Chapter='{chapter}', Hierarchy='{hierarchy}'") # Replaced by table log
                 sql = """
                     SELECT * FROM textbook_chunks
                     WHERE document_id = %s AND chapter_name = %s AND section_hierarchy = %s
@@ -495,10 +514,10 @@ def expand_short_sections(cursor, results: list[dict], top_k_threshold: int, gen
                 """
                 cursor.execute(sql, (doc_id, chapter, hierarchy))
                 section_chunks_raw = cursor.fetchall()
+                num_found = len(section_chunks_raw)
 
-                if len(section_chunks_raw) > 1: # Only expand if there are actually more chunks
+                if num_found > 1: # Only expand if there are actually more chunks in DB
                     section_chunks = [dict(chunk) for chunk in section_chunks_raw]
-                    # Add original rank and score to the group for later use
                     group_info = {
                         'type': 'group',
                         'original_rank': rank,
@@ -508,34 +527,54 @@ def expand_short_sections(cursor, results: list[dict], top_k_threshold: int, gen
                     }
                     processed_results.append(group_info)
                     expanded_sections.add(section_key) # Mark section as expanded
-                    print(f"    Expanded section '{hierarchy}' into a group of {len(section_chunks)} chunks.")
+                    log_row[4] = f"Expand Group ({num_found} total)"
+                    log_row[5] = num_found - 1 # Number of *added* chunks (total - original)
+                    # Track newly added chunk IDs (excluding the original trigger chunk ID)
+                    for chunk in section_chunks:
+                        chunk_id = chunk.get('id')
+                        if chunk_id and chunk_id != orig_chunk_id:
+                             added_chunk_ids.add(chunk_id)
                 else:
-                    # If only 1 chunk found, just add the original record back
-                    print(f"    Section '{hierarchy}' only contains 1 chunk in DB. Keeping original chunk.")
+                    # If only 1 chunk found in DB, just add the original record back
                     processed_results.append(record) # Keep original single chunk
+                    log_row[4] = "Keep Single (1 in DB)"
+                    log_row[5] = 0
             except Exception as e:
                 print(f"ERROR: Failed to fetch or process expansion for section {section_key}: {e}", file=sys.stderr)
                 traceback.print_exc()
                 processed_results.append(record) # Add original back on error
+                log_row[4] = "Error - Keep Single"
+                log_row[5] = 0
         else:
             # If no expansion needed, just add the original record
             processed_results.append(record)
+            # log_row already defaults to "Keep Single", 0
 
-    print(f"Finished section expansion. Result count: {len(processed_results)} (may include groups).")
-    return processed_results
+        expansion_log_data.append(log_row)
 
+    # Print the expansion log table
+    try:
+        print(tabulate(expansion_log_data, headers=headers_expansion, tablefmt="grid"))
+    except ImportError:
+        print("WARN: 'tabulate' library not found. Skipping table format.")
+        for row in expansion_log_data:
+            print(f"ID: {row[0]}, Rank: {row[1]}, Pages: {row[2]}, Threshold: {row[3]}, Action: {row[4]}, Added: {row[5]}")
 
-def fill_page_gaps(cursor, results: list[dict | list[dict]], max_gap: int) -> list[dict | list[dict]]:
+    print(f"Finished section expansion. Result count: {len(processed_results)} (items/groups). Added {len(added_chunk_ids)} new chunks.")
+    return processed_results, added_chunk_ids
+def fill_page_gaps(cursor, results: list[dict | list[dict]], max_gap: int) -> tuple[list[dict | list[dict]], set]:
     """
     Identifies small page gaps between consecutive results and fetches missing chunks.
-    Handles both single chunks and groups.
+    Handles both single chunks and groups. Returns the updated list and a set of added chunk IDs.
     """
     print(f"\n--- Step 3: Filling page gaps (Max Gap: {max_gap} pages) ---")
     if len(results) < 2:
-        return results # Need at least two items to have a gap
+        return results, set() # Need at least two items to have a gap
 
-    # Extract sequence and page info, handling groups
     items_with_ranges = []
+    gap_log_data = []
+    headers_gaps = ["Between Item (Seq)", "And Item (Seq)", "Page Gap", "Action", "Added Chunks"]
+    added_chunk_ids = set() # Track IDs added by this step
     for item in results:
         if isinstance(item, dict) and item.get('type') == 'group':
             # It's a group
@@ -546,25 +585,29 @@ def fill_page_gaps(cursor, results: list[dict | list[dict]], max_gap: int) -> li
             page_end = last_chunk.get('page_end')
             min_seq = first_chunk.get('sequence_number')
             max_seq = last_chunk.get('sequence_number')
-            if all(v is not None for v in [doc_id, page_start, page_end, min_seq, max_seq]):
+            if all(v is not None for v in [doc_id, page_start, page_end, min_seq, max_seq]): # Corrected indentation
                 items_with_ranges.append({
                     'item': item, 'doc_id': doc_id, 'page_start': page_start, 'page_end': page_end,
-                    'min_seq': min_seq, 'max_seq': max_seq, 'is_group': True
-                })
+                    'min_seq': min_seq, 'max_seq': max_seq, 'is_group': True,
+                            'id_repr': f"Group({min_seq}-{max_seq})" # Representation for logging
+                        })
         elif isinstance(item, dict):
              # It's a single chunk
             doc_id = item.get('document_id')
             page_start = item.get('page_start')
             page_end = item.get('page_end')
             seq = item.get('sequence_number')
+            chunk_id = item.get('id')
             if all(v is not None for v in [doc_id, page_start, page_end, seq]):
                  items_with_ranges.append({
                     'item': item, 'doc_id': doc_id, 'page_start': page_start, 'page_end': page_end,
-                    'min_seq': seq, 'max_seq': seq, 'is_group': False
+                    'min_seq': seq, 'max_seq': seq, 'is_group': False,
+                    'id_repr': f"Chunk({chunk_id})" # Representation for logging
                  })
 
     if len(items_with_ranges) < 2:
-        return results # Not enough valid items with page info
+        print("  Not enough items with page ranges to check for gaps.")
+        return results, set() # Not enough valid items with page info
 
     # Sort items by page_start primarily, then sequence number
     items_with_ranges.sort(key=lambda x: (x['page_start'], x['min_seq']))
@@ -578,10 +621,11 @@ def fill_page_gaps(cursor, results: list[dict | list[dict]], max_gap: int) -> li
             if last_item_info['doc_id'] == current_item_info['doc_id']:
                 page_gap = current_item_info['page_start'] - last_item_info['page_end'] - 1
                 seq_gap = current_item_info['min_seq'] - last_item_info['max_seq'] - 1
+                log_row = [f"{last_item_info['id_repr']} ({last_item_info['max_seq']})", f"{current_item_info['id_repr']} ({current_item_info['min_seq']})", page_gap, "None", 0]
 
                 # Check if gap is within threshold and sequence numbers make sense
                 if 0 < page_gap <= max_gap and seq_gap >= 0:
-                    print(f"  - Found gap of {page_gap} pages (Seq {last_item_info['max_seq']} to {current_item_info['min_seq']}). Fetching gap chunks.")
+                    # print(f"  - Found gap of {page_gap} pages (Seq {last_item_info['max_seq']} to {current_item_info['min_seq']}). Fetching gap chunks.") # Replaced by table
                     try:
                         sql = """
                             SELECT * FROM textbook_chunks
@@ -590,24 +634,51 @@ def fill_page_gaps(cursor, results: list[dict | list[dict]], max_gap: int) -> li
                         """
                         cursor.execute(sql, (current_item_info['doc_id'], last_item_info['max_seq'], current_item_info['min_seq']))
                         gap_chunks_raw = cursor.fetchall()
-                        if gap_chunks_raw:
+                        num_added = len(gap_chunks_raw)
+                        if num_added > 0:
                             gap_chunks = [dict(chunk) for chunk in gap_chunks_raw]
                             final_results_with_gaps.extend(gap_chunks) # Add gap chunks
-                            print(f"    Filled gap with {len(gap_chunks)} chunks.")
+                            log_row[3] = f"Fill Gap ({num_added} chunks)"
+                            log_row[4] = num_added
+                            # Track added IDs
+                            for chunk in gap_chunks:
+                                if chunk.get('id'): added_chunk_ids.add(chunk.get('id'))
                         else:
-                            print(f"    No chunks found in DB for gap between seq {last_item_info['max_seq']} and {current_item_info['min_seq']}.")
+                            # print(f"    No chunks found in DB for gap between seq {last_item_info['max_seq']} and {current_item_info['min_seq']}.") # Replaced by table
+                            log_row[3] = "No Chunks Found"
+                            log_row[4] = 0
                     except Exception as e:
                         print(f"ERROR: Failed to fetch or process gap fill between seq {last_item_info['max_seq']} and {current_item_info['min_seq']}: {e}", file=sys.stderr)
                         traceback.print_exc()
-                # else:
-                #      if page_gap > 0: print(f"  - Gap of {page_gap} pages is larger than max {max_gap}. Skipping.")
+                        log_row[3] = "Error Fetching"
+                        log_row[4] = 0
+                elif page_gap > max_gap:
+                     log_row[3] = f"Gap > {max_gap} pages"
+                     log_row[4] = 0
+                else: # page_gap <= 0 or seq_gap < 0
+                     log_row[3] = "No Gap / Overlap"
+                     log_row[4] = 0
+                gap_log_data.append(log_row)
+
 
         # Add the current item (chunk or group)
         final_results_with_gaps.append(current_item_info['item'])
         last_item_info = current_item_info
 
-    print(f"Finished gap filling. Result count: {len(final_results_with_gaps)}.")
-    return final_results_with_gaps
+    # Print the gap log table
+    if gap_log_data:
+        try:
+            print(tabulate(gap_log_data, headers=headers_gaps, tablefmt="grid"))
+        except ImportError:
+            print("WARN: 'tabulate' library not found. Skipping table format.")
+            for row in gap_log_data:
+                print(f"Between: {row[0]}, And: {row[1]}, Gap: {row[2]}, Action: {row[3]}, Added: {row[4]}")
+    else:
+        print("  No gaps checked (less than 2 items with page ranges).")
+
+
+    print(f"Finished gap filling. Result count: {len(final_results_with_gaps)}. Added {len(added_chunk_ids)} new chunks.")
+    return final_results_with_gaps, added_chunk_ids
 
 
 def rerank_by_importance(results: list[dict | list[dict]], importance_factor: float) -> list[dict | list[dict]]:
@@ -848,9 +919,23 @@ def generate_response(query: str):
     """
     Main function orchestrating the enhanced retrieval and response generation.
     """
-    print(f"--- Starting Enhanced Response Generation Process ---")
-    print(f"Query: '{query}'")
-    print(f"Initial K: {INITIAL_K}, Final K: {'All' if FINAL_K is None else FINAL_K}, Importance Factor: {IMPORTANCE_FACTOR}")
+    """
+    Main function orchestrating the enhanced retrieval and response generation.
+    """
+    print("\n" + "="*80)
+    print("--- Starting Enhanced Response Generation Process ---")
+    print("="*80)
+    print(f"\n>>> User Query:\n{query}\n")
+    print(f"--- Configuration ---")
+    print(f"Initial K Results: {INITIAL_K}")
+    print(f"Final K Results: {'All' if FINAL_K is None else FINAL_K}")
+    print(f"Importance Factor: {IMPORTANCE_FACTOR}")
+    print(f"Relevance Model: {RELEVANCE_MODEL}")
+    print(f"Response Model: {RESPONSE_MODEL}")
+    print(f"Expansion Thresholds: General={SECTION_EXPANSION_GENERAL_THRESHOLD}pg, Expanded={SECTION_EXPANSION_EXPANDED_THRESHOLD}pg (Top {SECTION_EXPANSION_TOP_K_THRESHOLD} / Multi-Chunk)")
+    print(f"Gap Fill Max Pages: {GAP_FILL_MAX_GAP}")
+    print("-" * 80)
+
 
     # 1. Create OpenAI Client
     client = create_openai_client()
@@ -889,47 +974,141 @@ def generate_response(query: str):
 
         # Convert to list of dicts and add initial rank
         initial_results = []
+        initial_chunk_ids = set() # Track initial IDs
+        similarity_table_data = []
+        headers = ["Rank", "Chunk ID", "Chapter", "Combined Score"]
+
         for i, row in enumerate(initial_results_raw):
             record = dict(row)
-            record['rank'] = i + 1
+            chunk_id = record.get('id')
+            rank = i + 1
+            record['rank'] = rank
             initial_results.append(record)
+            if chunk_id:
+                initial_chunk_ids.add(chunk_id)
+                similarity_table_data.append([
+                    rank,
+                    chunk_id,
+                    record.get('chapter_name', 'N/A'),
+                    f"{record.get('combined_score', 0.0):.4f}"
+                ])
+
         print(f"Retrieved {len(initial_results)} initial results.")
+        print("\n--- Initial Similarity Search Results ---")
+        try:
+            print(tabulate(similarity_table_data, headers=headers, tablefmt="grid"))
+        except ImportError:
+            print("WARN: 'tabulate' library not found. Install with 'pip install tabulate' for table formatting.")
+            for row in similarity_table_data:
+                print(f"Rank: {row[0]}, ID: {row[1]}, Chapter: {row[2]}, Score: {row[3]}")
+        print("-" * 80)
+
         processed_results = initial_results
+        all_added_chunk_ids = set() # Track IDs added by expansion/gaps
+        all_removed_chunk_ids = set() # Track IDs removed by filtering
 
         # --- Stage 2: Summary Relevance Filtering ---
-        processed_results = filter_by_summary_relevance(client, query, processed_results)
-        if not processed_results: return "No relevant information remained after summary filtering."
+        # Modify filter_by_summary_relevance to return the map
+        filtered_results, relevance_map = filter_by_summary_relevance(client, query, processed_results)
+        if not filtered_results: return "No relevant information remained after summary filtering."
+
+        # Log relevance filtering results
+        relevance_table_data = []
+        headers_relevance = ["Chunk ID", "Chapter", "Relevance (1=Yes, 0=No)", "Summary"]
+        current_filtered_ids = set()
+        for record in filtered_results:
+             chunk_id = record.get('id')
+             if chunk_id: current_filtered_ids.add(chunk_id)
+
+        for record in initial_results: # Iterate original results to show all
+             chunk_id = record.get('id')
+             relevance_score = relevance_map.get(str(chunk_id), "N/A (Not Processed)")
+             if relevance_score == 0:
+                 all_removed_chunk_ids.add(chunk_id) # Track removed IDs
+             relevance_table_data.append([
+                 chunk_id,
+                 record.get('chapter_name', 'N/A'),
+                 relevance_score,
+                 record.get('summary', '')[:100] + "..." # Truncate summary for display
+             ])
+
+        print("\n--- Summary Relevance Filtering Results ---")
+        try:
+            print(tabulate(relevance_table_data, headers=headers_relevance, tablefmt="grid"))
+        except ImportError:
+             print("WARN: 'tabulate' library not found. Skipping table format.")
+             for row in relevance_table_data:
+                 print(f"ID: {row[0]}, Chapter: {row[1]}, Relevant: {row[2]}, Summary: {row[3]}")
+        print(f"Removed {len(all_removed_chunk_ids)} chunks based on summary relevance.")
+        print("-" * 80)
+        processed_results = filtered_results # Update results
 
         # --- Stage 3: Section Expansion ---
-        processed_results = expand_short_sections(
+        # Modify expand_short_sections to return added IDs
+        expanded_results, added_by_expansion_ids = expand_short_sections(
             cursor,
-            processed_results,
+            processed_results, # Pass filtered results
             SECTION_EXPANSION_TOP_K_THRESHOLD,
             SECTION_EXPANSION_GENERAL_THRESHOLD,
             SECTION_EXPANSION_EXPANDED_THRESHOLD
         )
-        if not processed_results: return "No results remained after section expansion." # Should be unlikely
+        if not expanded_results: return "No results remained after section expansion."
+        all_added_chunk_ids.update(added_by_expansion_ids)
+        print("-" * 80)
+        processed_results = expanded_results # Update results
 
         # --- Stage 4: Gap Filling ---
-        processed_results = fill_page_gaps(cursor, processed_results, GAP_FILL_MAX_GAP)
-        if not processed_results: return "No results remained after gap filling." # Should be unlikely
+        # Modify fill_page_gaps to return added IDs
+        filled_results, added_by_gaps_ids = fill_page_gaps(cursor, processed_results, GAP_FILL_MAX_GAP)
+        if not filled_results: return "No results remained after gap filling."
+        all_added_chunk_ids.update(added_by_gaps_ids)
+        print("-" * 80)
+        processed_results = filled_results # Update results
 
         # --- Stage 5: Importance Reranking ---
         processed_results = rerank_by_importance(processed_results, IMPORTANCE_FACTOR)
+        print("-" * 80)
 
         # --- Stage 6: Final Sorting ---
         print("\n--- Step 5: Sorting final results by new_score ---")
-        # Sort based on 'new_score' added in the rerank step
         processed_results.sort(key=lambda x: x.get('new_score', 0.0) if isinstance(x, dict) else 0.0, reverse=True)
         print(f"Sorted {len(processed_results)} final items.")
+        print("-" * 80)
 
         # --- Stage 7: Truncation (Optional) ---
         if FINAL_K is not None and len(processed_results) > FINAL_K:
             print(f"\n--- Truncating results from {len(processed_results)} to {FINAL_K} ---")
             processed_results = processed_results[:FINAL_K]
+            print("-" * 80)
+
+        # --- Stage 7.5: Final Results Summary Log ---
+        print("\n--- Final Results Summary ---")
+        final_chunk_ids = set()
+        for item in processed_results:
+            if isinstance(item, dict) and item.get('type') == 'group':
+                for chunk in item.get('chunks', []):
+                    if chunk.get('id'): final_chunk_ids.add(chunk.get('id'))
+            elif isinstance(item, dict) and item.get('id'):
+                 final_chunk_ids.add(item.get('id'))
+            elif isinstance(item, psycopg2.extras.DictRow): # Handle gap-filled chunks if not dicts
+                 chunk_dict = dict(item)
+                 if chunk_dict.get('id'): final_chunk_ids.add(chunk_dict.get('id'))
+
+
+        print(f"Initial Chunk IDs ({len(initial_chunk_ids)}): {sorted(list(initial_chunk_ids))}")
+        print(f"Removed by Filtering ({len(all_removed_chunk_ids)}): {sorted(list(all_removed_chunk_ids))}")
+        # Added IDs are those in the final set that weren't in the initial set AND weren't removed
+        truly_added_ids = final_chunk_ids - (initial_chunk_ids - all_removed_chunk_ids)
+        print(f"Added by Expansion/Gaps ({len(truly_added_ids)}): {sorted(list(truly_added_ids))}")
+        # Verify all_added_chunk_ids matches truly_added_ids (debugging check)
+        # print(f"DEBUG: Tracked Added IDs ({len(all_added_chunk_ids)}): {sorted(list(all_added_chunk_ids))}")
+        print(f"Final Chunk IDs in Context ({len(final_chunk_ids)}): {sorted(list(final_chunk_ids))}")
+        print("-" * 80)
+
 
         # --- Stage 8: Format Cards ---
         formatted_chunks = format_chunks_as_cards(processed_results)
+        print("-" * 80)
 
         # --- Stage 9: Generate Final Response ---
         response_text = generate_response_from_chunks(client, query, formatted_chunks)
