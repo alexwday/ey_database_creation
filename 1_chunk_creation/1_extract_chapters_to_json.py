@@ -39,6 +39,7 @@ except ImportError:
 # --- Configuration & Constants ---
 INPUT_DIR = "1C_mdsplitkit_output"  # Directory containing input markdown files.
 OUTPUT_DIR = "2A_chapter_json"  # Directory to save output JSON files.
+DOCUMENT_ID = "YOUR_DOCUMENT_ID_HERE"  # <<< CHANGE THIS MANUALLY AS NEEDED
 
 # Regex to find page number tags like <!-- PageNumber="123" -->.
 PAGE_NUMBER_TAG_PATTERN = re.compile(r'<!--\s*PageNumber="(\d+)"\s*-->')
@@ -210,17 +211,18 @@ def extract_chapter_info(filename: str) -> tuple[int, str]:
     except ValueError:
         chapter_number = 0  # Default if conversion fails
 
-    # Get the filename without extension
-    chapter_name_base = os.path.splitext(basename)[0]
-    # Remove the "Chapter_XX_" or "XX_" prefix to get a cleaner name
-    cleaned_chapter_name = re.sub(
-        r"^(?:Chapter_)?\d+[_ -]+\s*", "", chapter_name_base, flags=re.IGNORECASE
+    # Get the filename without extension for cleanup (used for output filename)
+    chapter_name_base_for_filename = os.path.splitext(basename)[0]
+    # Remove the "Chapter_XX_" or "XX_" prefix to get a cleaner name for the output filename
+    cleaned_name_for_filename = re.sub(
+        r"^(?:Chapter_)?\d+[_ -]+\s*", "", chapter_name_base_for_filename, flags=re.IGNORECASE
     ).strip()
-    # If cleaning resulted in an empty string, use the original base name
-    if not cleaned_chapter_name:
-        cleaned_chapter_name = chapter_name_base
+    # If cleaning resulted in an empty string, use the original base name for the output filename
+    if not cleaned_name_for_filename:
+        cleaned_name_for_filename = chapter_name_base_for_filename
 
-    return chapter_number, cleaned_chapter_name
+    # Chapter name itself will be extracted from the first line in process_file
+    return chapter_number, cleaned_name_for_filename
 
 
 # --- Main Processing Logic ---
@@ -249,24 +251,23 @@ def process_file(
     try:
         print(f"Processing Stage 1 for: {file_basename}")
 
-        # 1. Extract chapter number and cleaned name from filename
-        chapter_number, cleaned_chapter_name = extract_chapter_info(file_basename)
+        # 1. Extract chapter number and a base name for the output filename
+        chapter_number, name_for_output_file = extract_chapter_info(file_basename)
 
-        # 2. Read raw content
+        # 2. Read entire raw content
         with open(md_file_path, "r", encoding="utf-8") as f:
             raw_content = f.read()
 
-        # 3. Assume first line is title, separate it from main content
-        #    (Content stored in JSON will not include this first line)
+        # 3. Extract chapter name from the first line
         content_lines = raw_content.split("\n", 1)
-        # chapter_title_line = content_lines[0] # Not used currently
-        content_body = content_lines[1] if len(content_lines) > 1 else ""
+        chapter_name_raw = content_lines[0].strip() if content_lines else file_basename # Use filename if empty
+        if not chapter_name_raw: # Handle case where first line is empty but file isn't
+             chapter_name_raw = f"Chapter {chapter_number} (Name Missing)"
 
-        # 4. Extract page mapping from the *entire* raw content (including title line)
-        #    This ensures page tags right at the start are captured correctly.
+        # 4. Extract page mapping from the *entire* raw content
         page_mapping = extract_page_mapping(raw_content)
 
-        # 5. Determine chapter page range
+        # 5. Determine chapter page range (using existing logic)
         chapter_page_start = 0
         chapter_page_end = 0
         if not page_mapping:
@@ -296,25 +297,26 @@ def process_file(
                 f"    Tags found. Derived page range: {chapter_page_start}-{chapter_page_end}"
             )
 
-        # 6. Clean the main content body (remove Azure tags) for token calculation
-        cleaned_content_body = clean_azure_tags(content_body)
+        # 6. Clean the *entire* raw content (remove Azure tags) for token calculation
+        cleaned_full_content = clean_azure_tags(raw_content)
 
-        # 7. Calculate token count on the cleaned main content body
-        chapter_tokens = count_tokens(cleaned_content_body)
+        # 7. Calculate token count on the cleaned *entire* content
+        chapter_token_count = count_tokens(cleaned_full_content)
 
-        # 8. Prepare output data structure
+        # 8. Prepare output data structure according to the new schema
         output_data = {
-            "chapter_name": cleaned_chapter_name,  # Use cleaned name from filename
+            "document_id": DOCUMENT_ID,
             "chapter_number": chapter_number,
-            "content": content_body,  # Store content *without* the first line (assumed title)
-            "chapter_tokens": chapter_tokens,
+            "chapter_name": chapter_name_raw, # Name from first line
+            "content": raw_content, # Store entire raw content
+            "chapter_token_count": chapter_token_count, # Calculated on cleaned full content
             "chapter_page_start": chapter_page_start,
             "chapter_page_end": chapter_page_end,
-            "source_filename": file_basename,  # Original filename for reference
+            "source_filename": file_basename, # Original filename for reference
         }
 
-        # 9. Construct output filename (e.g., 001_Introduction.json)
-        output_safe_name = cleanup_filename(cleaned_chapter_name)
+        # 9. Construct output filename using the cleaned name derived from the *input filename*
+        output_safe_name = cleanup_filename(name_for_output_file) # Use name derived from filename
         output_filename = f"{chapter_number:03d}_{output_safe_name}.json"
         output_filepath = os.path.join(output_dir, output_filename)
 
@@ -323,7 +325,7 @@ def process_file(
             json.dump(output_data, f, indent=2, ensure_ascii=False)
 
         print(
-            f"  Successfully created: {output_filename} (Pages: {chapter_page_start}-{chapter_page_end}, Tokens: {chapter_tokens})"
+            f"  Successfully created: {output_filename} (Pages: {chapter_page_start}-{chapter_page_end}, Tokens: {chapter_token_count})"
         )
         return True, chapter_page_start, chapter_page_end, output_filename
 
