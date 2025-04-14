@@ -141,12 +141,26 @@ def find_headings(raw_content: str) -> list[dict]:
     return headings
 
 
-def get_most_specific_heading(section_data: dict) -> str:
-    """
-    Retrieves the most specific (lowest level number) heading text associated
-    with a section from its metadata.
+def generate_hierarchy_string(section_data: dict) -> str:
+    """Generates a breadcrumb-style hierarchy string from level_X fields."""
+    parts = []
+    # Check level_1 up to the section's own level (or max 6)
+    max_level_to_check = section_data.get("level", 6)
+    for i in range(1, max_level_to_check + 1):
+        level_key = f"level_{i}"
+        heading_text = section_data.get(level_key)
+        if heading_text:
+            parts.append(heading_text)
+        else:
+            # Stop if a level is missing in the hierarchy path
+            break
+    return " > ".join(parts)
 
-    Checks `level_6`, `level_5`, ..., `level_1`, `chapter_name` in order.
+
+def get_heading_for_filename(section_data: dict) -> str:
+    """
+    Retrieves the most specific heading text for use in filenames.
+    Checks `level_6` down to `level_1`. Uses section_title as fallback.
 
     Args:
         section_data: The dictionary representing a section, containing keys like
@@ -155,60 +169,71 @@ def get_most_specific_heading(section_data: dict) -> str:
     Returns:
         The most specific heading text found, or 'Untitled_Section' as a fallback.
     """
-    # Start checking from the section's own reported level downwards.
-    current_level = section_data.get("level", 0)
-    for level_num in range(
-        current_level, 0, -1
-    ):  # Check level_current, level_current-1, ..., level_1
+    # Check from the most specific level down to level 1
+    current_level = section_data.get("level", 6) # Start from section's level or max 6
+    for level_num in range(current_level, 0, -1):
         level_key = f"level_{level_num}"
         heading_text = section_data.get(level_key)
         if heading_text:
             return heading_text
 
-    # Fallback to chapter name if no specific heading level text is found.
-    return section_data.get("chapter_name", "Untitled_Section")
+    # Fallback to the section_title if no level_X heading found
+    return section_data.get("section_title", "Untitled_Section")
 
 
 # --- Core Sectioning and Merging Logic ---
 
 
-def split_chapter_into_sections(
-    raw_content: str, headings: list[dict], chapter_name: str, chapter_number: int
-) -> list[dict]:
+def split_chapter_into_sections(chapter_data: dict, headings: list[dict]) -> list[dict]:
     """
-    Splits raw chapter content into initial sections based on all heading levels (1-6).
+    Splits raw chapter content into initial sections based on heading levels (1-6).
 
-    Each section starts at a heading and ends just before the next heading.
-    Metadata about the heading hierarchy (level_1, level_2, etc.) is added to each section.
+    Each section starts at a heading and ends just before the next heading. Metadata
+    about the heading hierarchy and pass-through fields are added.
 
     Args:
-        raw_content: The raw markdown content of the chapter.
+        chapter_data: Dictionary containing chapter info from Stage 1 JSON
+                      (must include 'content', 'chapter_name', 'chapter_number',
+                       'document_id', 'chapter_token_count', 'chapter_page_start',
+                       'chapter_page_end').
         headings: List of heading dicts from `find_headings` (must include DOCUMENT_END).
-        chapter_name: Name of the chapter (used as default level_1 heading).
-        chapter_number: Number of the chapter.
 
     Returns:
         A list of dictionaries, each representing a raw section including its
         content slice, position, and hierarchical heading context.
     """
+    raw_content = chapter_data["content"]
+    chapter_name = chapter_data["chapter_name"]
+    chapter_number = chapter_data["chapter_number"]
+    document_id = chapter_data["document_id"]
+    chapter_token_count = chapter_data["chapter_token_count"]
+    chapter_page_start = chapter_data["chapter_page_start"]
+    chapter_page_end = chapter_data["chapter_page_end"]
+
     # If no headings found (besides DOCUMENT_END), treat the whole chapter as one section.
     if len(headings) <= 1:
+        section_title = chapter_name # Use chapter name as title if no headings
         return [
             {
-                "chapter_name": chapter_name,
+                "document_id": document_id,
                 "chapter_number": chapter_number,
+                "chapter_name": chapter_name,
+                "chapter_token_count": chapter_token_count,
+                "chapter_page_start": chapter_page_start,
+                "chapter_page_end": chapter_page_end,
                 "raw_content_slice": raw_content,
-                "level": 1,  # Assign level 1 by default
-                "level_1": chapter_name,  # Use chapter name as level 1 heading
+                "level": 1,
+                "level_1": chapter_name,
+                "section_title": section_title,
                 "start_pos": 0,
                 "end_pos": len(raw_content),
-                "orig_section_num": 0,  # Original section index within chapter
+                "section_number": 1, # First section
             }
         ]
 
     # Stores the current active heading text for each level (1-6)
     current_heading_context = {f"level_{i}": None for i in range(1, 7)}
-    current_heading_context["level_1"] = chapter_name  # Initialize L1 with chapter name
+    current_heading_context["level_1"] = chapter_name # Initialize L1 with chapter name
 
     sections = []
     section_index_in_chapter = 0  # Track section order within the chapter
@@ -227,12 +252,17 @@ def split_chapter_into_sections(
             continue
 
         # Update the heading context based on the current heading's level
-        current_level = current_heading["level"]
+        current_heading_info = current_heading
+        current_level = current_heading_info["level"]
+        current_title = current_heading_info["text"]
+
         if 1 <= current_level <= 6:
-            current_heading_context[f"level_{current_level}"] = current_heading["text"]
+            current_heading_context[f"level_{current_level}"] = current_title
             # Reset lower-level headings in the context
             for lower_level in range(current_level + 1, 7):
                 current_heading_context[f"level_{lower_level}"] = None
+        else: # Handle potential intro section before first heading
+             current_title = chapter_name # Use chapter name if no heading
 
         # Extract the raw text slice for this section
         raw_section_slice = raw_content[section_start_pos:section_end_pos]
@@ -241,15 +271,20 @@ def split_chapter_into_sections(
         if raw_section_slice.strip():
             section_index_in_chapter += 1
             section_data = {
-                "chapter_name": chapter_name,
+                # Pass-through fields
+                "document_id": document_id,
                 "chapter_number": chapter_number,
+                "chapter_name": chapter_name,
+                "chapter_token_count": chapter_token_count,
+                "chapter_page_start": chapter_page_start,
+                "chapter_page_end": chapter_page_end,
+                # Section specific fields
                 "raw_content_slice": raw_section_slice,
-                # Assign the level of the heading that started this section
-                # Default to 1 if the first section doesn't start with a heading (e.g., intro text)
-                "level": current_level if current_level > 0 else 1,
+                "level": current_level if current_level > 0 else 1, # Assign level, default 1
+                "section_title": current_title, # Heading text starting this section
                 "start_pos": section_start_pos,
                 "end_pos": section_end_pos,
-                "orig_section_num": section_index_in_chapter,  # Original section index within chapter
+                "section_number": section_index_in_chapter, # Renamed from orig_section_num
             }
             # Add the current heading context (level_1 to level_6)
             for level_num in range(1, 7):
@@ -271,12 +306,12 @@ def merge_small_sections(
 
     Operates in two passes:
     1. Merges sections < `min_tokens` based on level and proximity.
-    2. Merges sections < `ultra_small_threshold` more aggressively, prioritizing
-       merging headings forward and content backward.
+    2. Merges sections < `ultra_small_threshold` more aggressively.
 
     Args:
         sections: List of cleaned section dictionaries (must include 'content',
-                  'token_count', 'start_pos', 'end_pos', 'level', 'chapter_number').
+                  'section_token_count', 'start_pos', 'end_pos', 'level', 'chapter_number',
+                  and other pass-through fields).
         min_tokens: Threshold for the first merging pass.
         max_tokens: Maximum allowed tokens for a merged section.
         ultra_small_threshold: Threshold for the second, more aggressive pass.
@@ -287,15 +322,16 @@ def merge_small_sections(
     if not sections:
         return []
 
-    # Ensure sections are sorted by their original position before merging
-    sections_to_process = sorted(sections, key=lambda s: s["start_pos"])
+    # Ensure sections are sorted by their original position (section_number) before merging
+    sections_to_process = sorted(sections, key=lambda s: s["section_number"])
 
     # --- Pass 1: Merge sections smaller than `min_tokens` ---
     pass1_merged = []
     i = 0
     while i < len(sections_to_process):
         current = sections_to_process[i]
-        current_tokens = current.get("token_count", 0)
+        # Use section_token_count for merging decisions
+        current_tokens = current.get("section_token_count", 0)
 
         # Keep sections that are already large enough
         if current_tokens >= min_tokens:
@@ -306,60 +342,48 @@ def merge_small_sections(
         # Attempt to merge small sections
         merged_pass1 = False
 
-        # Strategy 1: Merge forward with next section if same level and combined size <= max_tokens
+        # Strategy 1: Merge forward with next section if compatible levels and combined size <= max_tokens
         if i + 1 < len(sections_to_process):
             next_s = sections_to_process[i + 1]
-            next_tokens = next_s.get("token_count", 0)
+            next_tokens = next_s.get("section_token_count", 0)
             if (
                 current["chapter_number"] == next_s["chapter_number"]
-                and current.get("level") == next_s.get("level")
-                and
-                # next_tokens < min_tokens and # Removed: Merge even if next is large enough, if current is small
-                current_tokens + next_tokens <= max_tokens
+                and current.get("level") == next_s.get("level") # Require same level for forward merge
+                and current_tokens + next_tokens <= max_tokens
             ):
-
-                # Create merged section data
-                merged_data = current.copy()
-                merged_data["content"] = (
-                    f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
-                )
-                merged_data["token_count"] = current_tokens + next_tokens
-                merged_data["word_count"] = current.get("word_count", 0) + next_s.get(
-                    "word_count", 0
-                )
+                # Create merged section data, keeping metadata from the *first* section (current)
+                merged_data = current.copy() # Start with current's metadata
+                merged_data["content"] = f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
+                # Recalculate token count for the merged content
+                merged_data["section_token_count"] = count_tokens(merged_data["content"])
+                # Keep word count for reference, though less critical now
+                merged_data["word_count"] = current.get("word_count", 0) + next_s.get("word_count", 0)
                 merged_data["end_pos"] = next_s["end_pos"]
-                # Keep hierarchy info from the *first* section (current)
+                # All other fields (hierarchy, pass-through) are inherited from 'current'
 
                 pass1_merged.append(merged_data)
                 i += 2  # Skip the next section as it's now merged
                 merged_pass1 = True
 
-        # Strategy 2: Merge backward with the previously added section if possible
+        # Strategy 2: Merge backward with the previously added section if compatible
         if not merged_pass1 and pass1_merged:
             prev_s = pass1_merged[-1]
-            prev_tokens = prev_s.get("token_count", 0)
-            # Check chapter, token limits, and compatible levels (same level or current is one level deeper)
+            prev_tokens = prev_s.get("section_token_count", 0)
+            # Check chapter, token limits, and compatible levels (current is same or deeper level)
             if (
                 current["chapter_number"] == prev_s["chapter_number"]
                 and prev_tokens + current_tokens <= max_tokens
-                and (
-                    current.get("level") == prev_s.get("level")
-                    or current.get("level") == prev_s.get("level", 0) + 1
-                )
+                and current.get("level", 1) >= prev_s.get("level", 1) # Allow merging deeper level back
             ):
-
-                # Merge current into the previous section in the pass1_merged list
-                prev_s["content"] = (
-                    f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
-                )
-                prev_s["token_count"] = prev_tokens + current_tokens
-                prev_s["word_count"] = prev_s.get("word_count", 0) + current.get(
-                    "word_count", 0
-                )
+                # Merge current's content into the previous section
+                prev_s["content"] = f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
+                # Recalculate token count for the merged content
+                prev_s["section_token_count"] = count_tokens(prev_s["content"])
+                prev_s["word_count"] = prev_s.get("word_count", 0) + current.get("word_count", 0)
                 prev_s["end_pos"] = current["end_pos"]
-                # Hierarchy info remains from prev_s
+                # Metadata (hierarchy, pass-through) remains from prev_s
 
-                i += 1  # Move to the next section to process
+                i += 1 # Move to the next section to process
                 merged_pass1 = True
 
         # If no merge occurred, keep the current section as is
@@ -375,7 +399,8 @@ def merge_small_sections(
     i = 0
     while i < len(pass1_merged):
         current = pass1_merged[i]
-        current_tokens = current.get("token_count", 0)
+        # Use section_token_count for decisions here too
+        current_tokens = current.get("section_token_count", 0)
 
         # Keep sections that meet the ultra-small threshold
         if current_tokens >= ultra_small_threshold:
@@ -391,87 +416,81 @@ def merge_small_sections(
 
         # --- Preferred Merge Direction ---
         if is_heading_only:
-            # Headings prefer merging FORWARD (merge into the *next* section)
+            # Headings prefer merging FORWARD (merge *current* heading into the *next* section's content)
             if i + 1 < len(pass1_merged):
                 next_s = pass1_merged[i + 1]
-                next_tokens = next_s.get("token_count", 0)
+                next_tokens = next_s.get("section_token_count", 0)
                 if (
                     current["chapter_number"] == next_s["chapter_number"]
                     and current_tokens + next_tokens <= max_tokens
                 ):
-                    merged_data = next_s.copy()
-                    merged_data["content"] = (
-                        f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
-                    )
-                    merged_data["token_count"] = current_tokens + next_tokens
-                    merged_data["word_count"] = current.get(
-                        "word_count", 0
-                    ) + next_s.get("word_count", 0)
-                    merged_data["start_pos"] = current["start_pos"]
+                    # Create merged section, taking metadata from NEXT section but content from both
+                    merged_data = next_s.copy() # Start with next section's metadata
+                    merged_data["content"] = f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
+                    merged_data["section_token_count"] = count_tokens(merged_data["content"])
+                    merged_data["word_count"] = current.get("word_count", 0) + next_s.get("word_count", 0)
+                    merged_data["start_pos"] = current["start_pos"] # Start pos from current
+                    # Hierarchy etc. comes from next_s
+
                     final_merged.append(merged_data)
-                    i += 2
+                    i += 2 # Skip current and next
                     merged_pass2 = True
         else:
-            # Content sections prefer merging BACKWARD (merge into the *previous* section)
+            # Content sections prefer merging BACKWARD (merge *current* content into the *previous* section)
             if final_merged:
                 prev_s = final_merged[-1]
-                prev_tokens = prev_s.get("token_count", 0)
+                prev_tokens = prev_s.get("section_token_count", 0)
                 if (
                     current["chapter_number"] == prev_s["chapter_number"]
                     and prev_tokens + current_tokens <= max_tokens
                 ):
-                    prev_s["content"] = (
-                        f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
-                    )
-                    prev_s["token_count"] = prev_tokens + current_tokens
-                    prev_s["word_count"] = prev_s.get("word_count", 0) + current.get(
-                        "word_count", 0
-                    )
+                    # Merge current's content into previous
+                    prev_s["content"] = f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
+                    prev_s["section_token_count"] = count_tokens(prev_s["content"])
+                    prev_s["word_count"] = prev_s.get("word_count", 0) + current.get("word_count", 0)
                     prev_s["end_pos"] = current["end_pos"]
-                    i += 1
+                    # Metadata remains from prev_s
+                    i += 1 # Move to next item in pass1_merged
                     merged_pass2 = True
 
         # --- Fallback Merge Direction (if preferred failed) ---
         if not merged_pass2:
             if is_heading_only:
-                # Fallback for heading: Merge BACKWARD
+                # Fallback for heading: Merge BACKWARD (merge *current* heading into *previous*)
                 if final_merged:
                     prev_s = final_merged[-1]
-                    prev_tokens = prev_s.get("token_count", 0)
+                    prev_tokens = prev_s.get("section_token_count", 0)
                     if (
                         current["chapter_number"] == prev_s["chapter_number"]
                         and prev_tokens + current_tokens <= max_tokens
                     ):
-                        prev_s["content"] = (
-                            f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
-                        )
-                        prev_s["token_count"] = prev_tokens + current_tokens
-                        prev_s["word_count"] = prev_s.get(
-                            "word_count", 0
-                        ) + current.get("word_count", 0)
+                        # Merge current's content into previous
+                        prev_s["content"] = f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
+                        prev_s["section_token_count"] = count_tokens(prev_s["content"])
+                        prev_s["word_count"] = prev_s.get("word_count", 0) + current.get("word_count", 0)
                         prev_s["end_pos"] = current["end_pos"]
-                        i += 1
+                        # Metadata remains from prev_s
+                        i += 1 # Move to next item in pass1_merged
                         merged_pass2 = True
             else:
-                # Fallback for content: Merge FORWARD
+                # Fallback for content: Merge FORWARD (merge *current* content into *next*)
                 if i + 1 < len(pass1_merged):
                     next_s = pass1_merged[i + 1]
-                    next_tokens = next_s.get("token_count", 0)
+                    next_tokens = next_s.get("section_token_count", 0)
                     if (
                         current["chapter_number"] == next_s["chapter_number"]
                         and current_tokens + next_tokens <= max_tokens
                     ):
-                        merged_data = next_s.copy()
-                        merged_data["content"] = (
-                            f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
-                        )
-                        merged_data["token_count"] = current_tokens + next_tokens
-                        merged_data["word_count"] = current.get(
-                            "word_count", 0
-                        ) + next_s.get("word_count", 0)
-                        merged_data["start_pos"] = current["start_pos"]
+                        # Create merged section, taking metadata from NEXT section
+                        merged_data = next_s.copy() # Start with next section's metadata
+                        merged_data["content"] = f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
+                        merged_data["section_token_count"] = count_tokens(merged_data["content"])
+                        merged_data["word_count"] = current.get("word_count", 0) + next_s.get("word_count", 0)
+                        merged_data["start_pos"] = current["start_pos"] # Start pos from current
+                        # Hierarchy etc. comes from next_s
+
                         final_merged.append(merged_data)
-                        i += 2
+                        i += 2 # Skip current and next
                         merged_pass2 = True
 
         # If no merge happened in Pass 2 either, keep the ultra-small section
@@ -499,36 +518,34 @@ def process_chapter_json(chapter_json_path: str, output_dir: str) -> int:
     try:
         print(f"Processing Stage 2 for: {chapter_file_basename}")
 
-        # 1. Load chapter data from JSON
+        # 1. Load chapter data from Stage 1 JSON
         with open(chapter_json_path, "r", encoding="utf-8") as f:
             chapter_data = json.load(f)
 
-        raw_content = chapter_data[
-            "content"
-        ]  # Content excluding title line from Stage 1
-        chapter_name = chapter_data["chapter_name"]
+        # Extract required fields (including new pass-through fields)
+        raw_content = chapter_data["content"] # Now includes title line
         chapter_number = chapter_data["chapter_number"]
-        source_md_filename = chapter_data["source_filename"]  # Original MD filename
+        source_md_filename = chapter_data["source_filename"] # Original MD filename
 
         # 2. Find headings in the raw content
         headings = find_headings(raw_content)
 
-        # 3. Split into initial sections based on headings
-        initial_sections = split_chapter_into_sections(
-            raw_content, headings, chapter_name, chapter_number
-        )
+        # 3. Split into initial sections based on headings, passing chapter_data
+        initial_sections = split_chapter_into_sections(chapter_data, headings)
         print(f"  Initial sections identified: {len(initial_sections)}")
 
-        # 4. Clean content and calculate metrics for each section
+        # 4. Clean content and calculate initial metrics for each section
         cleaned_sections = []
         for section_raw in initial_sections:
             # Clean Azure tags from the raw slice
             cleaned_content = clean_azure_tags(section_raw["raw_content_slice"])
             # Only keep sections with non-whitespace content after cleaning
             if cleaned_content.strip():
-                section_clean = section_raw.copy()
-                section_clean["content"] = cleaned_content  # Store cleaned content
-                section_clean["token_count"] = count_tokens(cleaned_content)
+                section_clean = section_raw.copy() # Keep all fields from initial split
+                section_clean["content"] = cleaned_content # Store cleaned content
+                # Calculate and store the *initial* token count
+                section_clean["section_token_count"] = count_tokens(cleaned_content)
+                # Keep word count for reference
                 section_clean["word_count"] = len(re.findall(r"\w+", cleaned_content))
                 # Remove raw slice now that we have cleaned content
                 section_clean.pop("raw_content_slice", None)
@@ -536,22 +553,32 @@ def process_chapter_json(chapter_json_path: str, output_dir: str) -> int:
         print(f"  Sections after cleaning & filtering empty: {len(cleaned_sections)}")
 
         # 5. Merge small sections using the defined thresholds
+        # The merge function now uses 'section_token_count' for decisions and updates it
         merged_sections = merge_small_sections(
             cleaned_sections, MIN_TOKENS, MAX_TOKENS, ULTRA_SMALL_THRESHOLD
         )
         print(f"  Sections after merging small ones: {len(merged_sections)}")
 
         # 6. Save final sections to individual JSON files
-        section_output_index = 0  # Index for output filename within this chapter
+        section_output_index = 0 # Index for output filename within this chapter
         for section_data in merged_sections:
             section_output_index += 1
 
-            # Prepare data for saving
+            # Prepare data for saving, ensuring all required fields are present
             save_data = section_data.copy()
-            # Keep 'orig_section_num' in the output JSON
+
+            # Rename the final token count field to 'chunk_token_count'
+            if "section_token_count" in save_data:
+                 save_data["chunk_token_count"] = save_data.pop("section_token_count")
+            else:
+                 # Should not happen if merge logic is correct, but fallback
+                 save_data["chunk_token_count"] = count_tokens(save_data.get("content", ""))
+
+            # Generate the hierarchy string
+            save_data["section_hierarchy"] = generate_hierarchy_string(save_data)
 
             # Determine filename based on most specific heading
-            heading_for_filename = get_most_specific_heading(save_data)
+            heading_for_filename = get_heading_for_filename(save_data)
             clean_heading_name = cleanup_filename(heading_for_filename)
             # Fallback filename part if cleaning results in empty string
             if not clean_heading_name:
@@ -565,10 +592,18 @@ def process_chapter_json(chapter_json_path: str, output_dir: str) -> int:
             save_data["source_chapter_json_file"] = chapter_file_basename
             save_data["source_markdown_file"] = source_md_filename
 
+            # Remove intermediate fields not needed in final output (optional cleanup)
+            save_data.pop("word_count", None)
+            # Keep level_X fields for now as they define hierarchy
+
             # Write the section data to its JSON file
-            with open(output_filepath, "w", encoding="utf-8") as f:
-                json.dump(save_data, f, indent=2, ensure_ascii=False)
-            final_saved_count += 1
+            try:
+                with open(output_filepath, "w", encoding="utf-8") as f:
+                    json.dump(save_data, f, indent=2, ensure_ascii=False)
+                final_saved_count += 1
+            except Exception as write_err:
+                 print(f"\nERROR writing file {output_filename}: {write_err}")
+                 # Continue processing other sections
 
         print(f"  Saved {final_saved_count} final sections for this chapter.")
         return final_saved_count
