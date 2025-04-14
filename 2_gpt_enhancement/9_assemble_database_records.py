@@ -54,7 +54,10 @@ def sanitize_filename_part(section_id_str):
     return safe_id
 
 def load_all_chunks(input_dir):
-    """Loads all chunk JSONs, validates required fields, and sorts by 'order'."""
+    """
+    Loads all chunk JSONs, validates required fields, and sorts by 'sequence_number'.
+    Required fields based on Stage 5 output.
+    """
     all_chunks_data = []
     input_path = Path(input_dir)
     print(f"Loading chunks from: {input_path}")
@@ -74,13 +77,13 @@ def load_all_chunks(input_dir):
     error_count = 0
     skipped_missing_field = 0
 
+    # Fields required from the final chunk file (output of Stage 5)
     required_fields = [
-        'order', 'chapter_number', 'orig_section_num', 'content',
-        # 'section_name', # Removed as it's not present
-        'chapter_name', # Added based on user feedback
-        'section_page_start', # Added based on user feedback
-        'section_page_end' # Added based on user feedback
-        # level_X fields are checked dynamically later
+        'sequence_number', 'chapter_number', 'section_number', 'part_number',
+        'document_id', 'chapter_name', 'chapter_token_count',
+        'section_start_page', 'section_end_page', 'section_token_count',
+        'section_hierarchy', 'section_title', 'content', 'chunk_token_count',
+        'start_pos', 'end_pos' # Keep start/end pos for potential future use/debugging
     ]
 
     # Use tqdm.notebook here
@@ -96,13 +99,19 @@ def load_all_chunks(input_dir):
                 skipped_missing_field += 1
                 continue
 
-            # Basic type checks
-            if not isinstance(data['order'], int):
-                 print(f"WARNING: Invalid 'order' field type in {filepath.name}. Skipping.")
+            # Basic type checks (add more as needed)
+            if not isinstance(data['sequence_number'], int): # Check sequence_number
+                 print(f"WARNING: Invalid 'sequence_number' field type in {filepath.name}. Skipping.")
                  skipped_missing_field += 1
                  continue
-            # chapter_number can be str or int, handle later
-            # orig_section_num can be str or int, handle later
+            if not isinstance(data['section_number'], int): # Check section_number
+                 print(f"WARNING: Invalid 'section_number' field type in {filepath.name}. Skipping.")
+                 skipped_missing_field += 1
+                 continue
+            if not isinstance(data['part_number'], int): # Check part_number
+                 print(f"WARNING: Invalid 'part_number' field type in {filepath.name}. Skipping.")
+                 skipped_missing_field += 1
+                 continue
             if not isinstance(data['content'], str):
                  print(f"WARNING: Invalid 'content' field type in {filepath.name}. Skipping.")
                  skipped_missing_field += 1
@@ -130,10 +139,10 @@ def load_all_chunks(input_dir):
         print("ERROR: No valid chunks were loaded.")
         return None
 
-    # --- Sort by the 'order' field ---
+    # --- Sort by the 'sequence_number' field ---
     try:
-        all_chunks_data.sort(key=lambda x: x['order'])
-        print(f"Successfully sorted {len(all_chunks_data)} chunks by 'order' field.")
+        all_chunks_data.sort(key=lambda x: x['sequence_number'])
+        print(f"Successfully sorted {len(all_chunks_data)} chunks by 'sequence_number' field.")
     except Exception as e:
         print(f"ERROR: An unexpected error occurred during sorting: {e}")
         return None # Cannot proceed without sorting
@@ -227,15 +236,17 @@ def load_section_details(input_dir):
 
     required_fields = [
         "section_summary", "section_tags", "section_standard",
-        "section_standard_codes", "section_importance", "section_references"
+        # Use the renamed field from Stage 8
+        "section_standard_codes", "section_importance_score", "section_references"
     ]
 
-    temp_section_details_map = {} # Key: (chapter_num, sanitized_section_id_from_filename)
+    temp_section_details_map = {} # Key: (chapter_num, section_number_from_filename)
 
     # Use tqdm.notebook here
     for filepath in tqdm(filenames, desc="Loading Section Details"):
         try:
-            # Extract chapter number and *sanitized* section ID from filename
+            # Extract chapter number and section number from filename
+            # Assumes filename format: chapter_{chap_num}_section_{sec_num}_details.json
             filename_stem = filepath.stem # Removes .json
             if not filename_stem.endswith("_details"):
                 skipped_parse_error += 1
@@ -249,7 +260,7 @@ def load_section_details(input_dir):
                 continue
 
             chapter_part = parts[0]
-            sanitized_section_id = parts[1]
+            section_num_str = parts[1] # This should be the section number
             chapter_num_str = chapter_part[len("chapter_"):]
 
             # Attempt to convert chapter num to int if possible
@@ -257,6 +268,15 @@ def load_section_details(input_dir):
                 chapter_key = int(chapter_num_str)
             except ValueError:
                 chapter_key = chapter_num_str
+
+            # Attempt to convert section num to int
+            try:
+                section_key = int(section_num_str)
+            except ValueError:
+                 print(f"WARNING: Could not parse section number '{section_num_str}' as int from filename: {filepath.name}. Skipping.")
+                 skipped_parse_error += 1
+                 continue
+
 
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -273,10 +293,12 @@ def load_section_details(input_dir):
             if not isinstance(data.get('section_tags'), list): print(f"WARNING: Type mismatch: 'section_tags' in {filepath.name}")
             if not isinstance(data.get('section_standard'), str): print(f"WARNING: Type mismatch: 'section_standard' in {filepath.name}")
             if not isinstance(data.get('section_standard_codes'), list): print(f"WARNING: Type mismatch: 'section_standard_codes' in {filepath.name}")
-            if not isinstance(data.get('section_importance'), (float, int)): print(f"WARNING: Type mismatch: 'section_importance' in {filepath.name}")
+            # Check renamed field
+            if not isinstance(data.get('section_importance_score'), (float, int)): print(f"WARNING: Type mismatch: 'section_importance_score' in {filepath.name}")
             if not isinstance(data.get('section_references'), list): print(f"WARNING: Type mismatch: 'section_references' in {filepath.name}")
 
-            temp_section_details_map[(chapter_key, sanitized_section_id)] = data
+            # Key is now (chapter_key, section_key)
+            temp_section_details_map[(chapter_key, section_key)] = data
             loaded_count += 1
 
         except json.JSONDecodeError:
@@ -292,24 +314,9 @@ def load_section_details(input_dir):
     if error_count > 0:
         print(f"WARNING: Failed to load or parse {error_count} section detail files.")
 
-    return temp_section_details_map # Return map keyed by sanitized ID
+    return temp_section_details_map # Return map keyed by (chapter_num, section_num)
 
-def build_section_hierarchy(chunk_data):
-    """Builds the section hierarchy string from level_X fields."""
-    levels = []
-    i = 1
-    while True:
-        level_key = f"level_{i}"
-        if level_key in chunk_data:
-            level_value = chunk_data[level_key]
-            if level_value and isinstance(level_value, str): # Ensure it's a non-empty string
-                 levels.append(level_value.strip())
-            i += 1
-        else:
-            break
-    hierarchy_str = " > ".join(levels) if levels else ""
-    highest_level_title = levels[-1] if levels else ""
-    return hierarchy_str, highest_level_title
+# Removed build_section_hierarchy function as fields are now directly loaded
 
 
 # --- Main Assembly Logic (Top Level for Notebook) ---
@@ -344,10 +351,20 @@ else:
         # Use tqdm.notebook here
         for chunk in tqdm(all_chunks, desc="Assembling Records"):
             try:
-                # --- Get Keys ---
-                chunk_order = chunk['order']
+                # --- Get Keys and Data from Chunk ---
+                sequence_num = chunk['sequence_number']
                 chapter_num = chunk['chapter_number']
-                orig_section_num = chunk['orig_section_num'] # The *original* section number
+                section_num = chunk['section_number'] # Use section_number
+                part_num = chunk['part_number']
+                doc_id = chunk['document_id']
+                chunk_chapter_name = chunk['chapter_name']
+                chunk_chapter_tokens = chunk['chapter_token_count']
+                chunk_section_start_page = chunk['section_page_start']
+                chunk_section_end_page = chunk['section_end_page']
+                chunk_section_tokens = chunk['section_token_count']
+                chunk_section_hierarchy = chunk['section_hierarchy']
+                chunk_section_title = chunk['section_title']
+                chunk_content = chunk['content']
 
                 # Convert chapter_num to int if possible for lookup consistency
                 try:
@@ -359,70 +376,81 @@ else:
                 chapter_details = chapter_details_map.get(lookup_chapter_key)
                 if chapter_details is None:
                     missing_chapter_details_count += 1
+                    # Provide defaults if chapter details are missing
+                    chapter_summary = ""
                     chapter_tags = []
                 else:
+                    chapter_summary = chapter_details.get('chapter_summary', "")
                     chapter_tags = chapter_details.get('chapter_tags', [])
 
                 # --- Get Section Details ---
-                sanitized_section_id = sanitize_filename_part(orig_section_num)
-                section_lookup_key = (lookup_chapter_key, sanitized_section_id)
+                # Use section_num (already an int from validation) for lookup
+                section_lookup_key = (lookup_chapter_key, section_num)
                 section_details = temp_section_details_map.get(section_lookup_key)
 
                 if section_details is None:
                     missing_section_details_count += 1
-                    section_summary = ""
+                    # Provide defaults if section details are missing
+                    section_summary = "" # Crucial field for DB
                     section_standard = "N/A"
                     section_standard_codes = []
-                    section_importance = 0.5
+                    section_importance_score = 0.5 # Use renamed field
                     section_references = []
+                    section_tags = [] # Added default
                 else:
-                    section_summary = section_details.get('section_summary', "")
+                    section_summary = section_details.get('section_summary', "") # Crucial field for DB
                     section_standard = section_details.get('section_standard', "N/A")
                     section_standard_codes = section_details.get('section_standard_codes', [])
-                    section_importance = section_details.get('section_importance', 0.5)
+                    section_importance_score = section_details.get('section_importance_score', 0.5) # Use renamed field
                     section_references = section_details.get('section_references', [])
-
-                # --- Build Hierarchy and Get Title ---
-                hierarchy_str, highest_level_title = build_section_hierarchy(chunk)
+                    section_tags = section_details.get('section_tags', []) # Added default
 
                 # --- Assemble Final Record ---
                 record = {
-                    # SYSTEM
-                    "id": None, # Omit for DB generation
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    # SYSTEM FIELDS (DB Generated)
+                    "id": None,
+                    "created_at": datetime.now(timezone.utc).isoformat(), # Script generated, may be overwritten by DB
 
-                    # FILTER FIELDS
-                    "document_id": "ey_international_gaap_2024", # Hardcoded as requested
-                    # Format chapter_name as chapter_{num}_{name}
-                    "chapter_name": f"chapter_{str(chapter_num).zfill(2)}_{chunk.get('chapter_name', '')}",
-                    "tags": chapter_tags,
-                    "standard": section_standard,
-                    "standard_codes": section_standard_codes,
+                    # STRUCTURAL POSITIONING FIELDS (From Chunk)
+                    "document_id": doc_id,
+                    "chapter_number": chapter_num,
+                    "section_number": section_num,
+                    "part_number": part_num,
+                    "sequence_number": sequence_num,
 
-                    # HYBRID SEARCH FIELDS
-                    "embedding": None, # Placeholder for later step
-                    "text_search_vector": None, # Omit for DB generation
+                    # CHAPTER-LEVEL METADATA (From Chunk & Chapter Details)
+                    "chapter_name": chunk_chapter_name,
+                    "chapter_tags": chapter_tags,
+                    "chapter_summary": chapter_summary,
+                    "chapter_token_count": chunk_chapter_tokens,
 
-                    # RERANKING FIELDS
-                    "sequence_number": chunk_order,
+                    # SECTION-LEVEL PAGINATION & IMPORTANCE (From Chunk & Section Details)
+                    "section_start_page": chunk_section_start_page,
+                    "section_end_page": chunk_section_end_page,
+                    "section_importance_score": section_importance_score,
+                    "section_token_count": chunk_section_tokens,
+
+                    # SECTION-LEVEL METADATA (From Chunk & Section Details)
+                    "section_hierarchy": chunk_section_hierarchy,
+                    "section_title": chunk_section_title,
+                    "section_standard": section_standard,
+                    "section_standard_codes": section_standard_codes,
                     "section_references": section_references,
-                    "page_start": chunk.get("section_page_start"), # Use correct field 'section_page_start'
-                    "page_end": chunk.get("section_page_end"),   # Use correct field 'section_page_end'
-                    "summary": section_summary,
-                    "importance_score": section_importance,
+                    # Note: section_tags from Stage 8 are intermediate, not in final schema
 
-                    # METADATA FIELDS
-                    "section_hierarchy": hierarchy_str,
-                    "section_title": highest_level_title, # Derived from highest level_X field
+                    # CONTENT & EMBEDDING (Content from Chunk, Embedding later)
+                    "content": chunk_content,
+                    "embedding": None, # Placeholder
+                    "text_search_vector": None, # Placeholder (DB Generated)
 
-                    # CONTENT
-                    "content": chunk.get('content', "")
+                    # INTERMEDIATE FIELD NEEDED IN DB (From Section Details)
+                    "section_summary": section_summary
                 }
 
                 final_records.append(record)
 
             except Exception as e:
-                print(f"ERROR: Error processing chunk with order {chunk.get('order', 'N/A')}: {e}")
+                print(f"ERROR: Error processing chunk with sequence {chunk.get('sequence_number', 'N/A')}: {e}")
                 # traceback.print_exc() # Optional
 
         print(f"Finished assembling {len(final_records)} records.")
@@ -430,7 +458,7 @@ else:
             print(f"WARNING: Chapter details were missing for {missing_chapter_details_count} lookups.")
         if missing_section_details_count > 0:
             # Add a note about checking the field names
-            print(f"WARNING: Section details were missing for {missing_section_details_count} lookups. Check if 'orig_section_num' in chunks correctly maps to sanitized IDs in section detail filenames.")
+            print(f"WARNING: Section details were missing for {missing_section_details_count} lookups. Check if 'section_number' in chunks correctly maps to section numbers in section detail filenames.")
 
         # 4. Save output
         output_file_path = output_path / OUTPUT_FILENAME

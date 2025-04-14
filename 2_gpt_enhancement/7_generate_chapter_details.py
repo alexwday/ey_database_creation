@@ -530,7 +530,7 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
 
     loaded_count = 0
     error_count = 0
-    skipped_missing_order = 0
+    skipped_missing_sequence = 0
     skipped_missing_chapter = 0
 
     for filename in filenames:
@@ -540,19 +540,22 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
                 data = json.load(f)
 
             # --- Validation ---
-            if 'order' not in data or not isinstance(data['order'], int):
-                print(f"Warning: Missing or invalid 'order' field in {filename}. Skipping.")
-                skipped_missing_order += 1
+            # Check for 'sequence_number' instead of 'order'
+            if 'sequence_number' not in data or not isinstance(data['sequence_number'], int):
+                print(f"Warning: Missing or invalid 'sequence_number' field in {filename}. Skipping.")
+                skipped_missing_sequence += 1
                 continue
 
             chapter_number = data.get('chapter_number')
             if chapter_number is None:
-                print(f"Warning: Missing 'chapter_number' in {filename} (Order: {data['order']}). Skipping.")
+                # Use sequence_number in the warning message
+                print(f"Warning: Missing 'chapter_number' in {filename} (Sequence: {data['sequence_number']}). Skipping.")
                 skipped_missing_chapter += 1
                 continue
 
             if 'content' not in data or 'chunk_token_count' not in data:
-                 print(f"Warning: Missing 'content' or 'chunk_token_count' in {filename} (Order: {data['order']}). Skipping.")
+                 # Use sequence_number in the warning message
+                 print(f"Warning: Missing 'content' or 'chunk_token_count' in {filename} (Sequence: {data['sequence_number']}). Skipping.")
                  error_count += 1
                  continue
             # --- End Validation ---
@@ -569,8 +572,9 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
             error_count += 1
 
     print(f"Successfully loaded data for {loaded_count} chunks.")
-    if skipped_missing_order > 0:
-        print(f"Skipped {skipped_missing_order} chunks missing or invalid 'order'.")
+    # Update warning message
+    if skipped_missing_sequence > 0:
+        print(f"Skipped {skipped_missing_sequence} chunks missing or invalid 'sequence_number'.")
     if skipped_missing_chapter > 0:
          print(f"Skipped {skipped_missing_chapter} chunks missing 'chapter_number'.")
     if error_count > 0:
@@ -580,13 +584,15 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
         print("No valid chunks were loaded.")
         return None
 
-    # --- Sort by the 'order' field ---
+    # --- Sort by the 'sequence_number' field ---
     try:
-        all_chunks_data.sort(key=lambda x: x['order'])
-        print(f"Successfully sorted {len(all_chunks_data)} chunks by 'order' field.")
+        # Sort by 'sequence_number'
+        all_chunks_data.sort(key=lambda x: x['sequence_number'])
+        print(f"Successfully sorted {len(all_chunks_data)} chunks by 'sequence_number' field.")
     except KeyError:
         # This shouldn't happen due to validation above, but as a safeguard
-        print("Error: Sorting failed because 'order' key was missing in some loaded chunks.")
+        # Update error message
+        print("Error: Sorting failed because 'sequence_number' key was missing in some loaded chunks.")
         return None
     except Exception as e:
         print(f"An unexpected error occurred during sorting: {e}")

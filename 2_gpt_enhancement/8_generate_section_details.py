@@ -91,7 +91,7 @@ SECTION_TOOL_SCHEMA = {
                     "items": {"type": "string"},
                     "description": "A list of specific standard codes explicitly mentioned or directly relevant in the section (e.g., ['IFRS 16', 'IAS 17']). The number of codes should reflect the section's content. These codes will be used as metadata for search reranking."
                 },
-                "section_importance": {
+                "section_importance_score": { # Renamed field
                     "type": "number",
                     "description": "A score between 0.0 (low importance) and 1.0 (high importance) indicating how crucial this section is to understanding the overall chapter's topic. A score of 0.5 indicates average or unknown importance. This float value will be used for search reranking.",
                     "minimum": 0.0,
@@ -103,7 +103,8 @@ SECTION_TOOL_SCHEMA = {
                     "description": "A list of explicit references to other sections, chapters, or standard codes found within this section's text (e.g., ['See Section 4.5', 'Refer to Chapter 3', 'IAS 36.12']). Provide an empty list [] if none are found. These references provide context."
                 }
             },
-            "required": ["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance", "section_references"]
+            # Updated required field name
+            "required": ["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance_score", "section_references"]
         }
     }
 }
@@ -330,9 +331,9 @@ def parse_gpt_json_response(response_content_str, expected_keys):
              logging.warning("Type mismatch: 'section_standard' is not a string.")
         if 'section_standard_codes' in expected_keys and not isinstance(data.get('section_standard_codes'), list):
              logging.warning("Type mismatch: 'section_standard_codes' is not a list.")
-        # Accept float or int (for 0 or 1)
-        if 'section_importance' in expected_keys and not isinstance(data.get('section_importance'), (float, int)):
-             logging.warning("Type mismatch: 'section_importance' is not a number (float or int).")
+        # Accept float or int (for 0 or 1) - Check renamed field
+        if 'section_importance_score' in expected_keys and not isinstance(data.get('section_importance_score'), (float, int)):
+             logging.warning("Type mismatch: 'section_importance_score' is not a number (float or int).")
 
 
         logging.debug("GPT JSON response parsed successfully.") # Changed to DEBUG
@@ -349,8 +350,8 @@ def parse_gpt_json_response(response_content_str, expected_keys):
 def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
     """
     Loads all chunk JSONs from the input directory, validates required fields
-    ('order', 'chapter_number', 'content', 'chunk_token_count', 'orig_section_num'),
-    sorts them by 'order', and groups them by 'chapter_number'.
+    ('sequence_number', 'chapter_number', 'content', 'chunk_token_count', 'section_number'),
+    sorts them by 'sequence_number', and groups them by 'chapter_number'.
     Returns a dictionary mapping chapter numbers to lists of chunk dicts.
     """
     all_chunks_data = []
@@ -377,9 +378,10 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
                 data = json.load(f)
 
             # --- Validation ---
-            # Use 'orig_section_num' as the key identifier for the section before splitting.
-            required_fields = ['order', 'chapter_number', 'content', 'chunk_token_count', 'orig_section_num']
-            section_id_field = 'orig_section_num' # Use the original section number
+            # Use 'section_number' as the key identifier for the section.
+            # Use 'sequence_number' for sorting.
+            required_fields = ['sequence_number', 'chapter_number', 'content', 'chunk_token_count', 'section_number']
+            section_id_field = 'section_number' # Use the final section number
 
             missing_fields = [field for field in required_fields if field not in data]
             if missing_fields:
@@ -388,19 +390,19 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
                 continue
 
             # Validate types for key fields
-            if not isinstance(data['order'], int):
-                 logging.warning(f"Invalid 'order' field type in {filepath.name}. Skipping.")
+            if not isinstance(data['sequence_number'], int): # Check sequence_number
+                 logging.warning(f"Invalid 'sequence_number' field type in {filepath.name}. Skipping.")
                  skipped_missing_field += 1
                  continue
-            if not isinstance(data['orig_section_num'], int):
-                 logging.warning(f"Invalid 'orig_section_num' field type in {filepath.name}. Skipping.")
+            if not isinstance(data['section_number'], int): # Check section_number
+                 logging.warning(f"Invalid 'section_number' field type in {filepath.name}. Skipping.")
                  skipped_missing_field += 1
                  continue
             # --- End Validation ---
 
-            # Store the original section number as the identifier value
+            # Store the section number as the identifier value
             # Use a consistent internal key '_section_id_value' for the grouping logic later
-            data['_section_id_value'] = data[section_id_field] # Store the value of orig_section_num
+            data['_section_id_value'] = data[section_id_field] # Store the value of section_number
 
             all_chunks_data.append(data)
             loaded_count += 1
@@ -422,10 +424,10 @@ def load_all_chunk_data_grouped(input_dir=CHUNK_INPUT_DIR):
         logging.error("No valid chunks were loaded.")
         return None
 
-    # --- Sort by the 'order' field ---
+    # --- Sort by the 'sequence_number' field ---
     try:
-        all_chunks_data.sort(key=lambda x: x['order'])
-        logging.info(f"Successfully sorted {len(all_chunks_data)} chunks by 'order' field.")
+        all_chunks_data.sort(key=lambda x: x['sequence_number']) # Sort by sequence_number
+        logging.info(f"Successfully sorted {len(all_chunks_data)} chunks by 'sequence_number' field.")
     except Exception as e:
         logging.error(f"An unexpected error occurred during sorting: {e}", exc_info=True)
         return None # Cannot proceed without sorting
@@ -471,24 +473,24 @@ def load_chapter_details(chapter_number, input_dir=CHAPTER_DETAILS_INPUT_DIR):
         return None
 
 def group_chunks_by_section(chapter_chunks):
-    """Groups chunks within a chapter by their original section number."""
+    """Groups chunks within a chapter by their section number."""
     grouped_by_section = defaultdict(list)
     if not chapter_chunks:
         return grouped_by_section
 
-    # Use the consistent internal key '_section_id_value' which holds the orig_section_num
+    # Use the consistent internal key '_section_id_value' which holds the section_number
     section_id_key = '_section_id_value'
 
     for chunk in chapter_chunks:
-        section_id = chunk.get(section_id_key) # Get the original section number
+        section_id = chunk.get(section_id_key) # Get the section number
         if section_id is not None:
             grouped_by_section[section_id].append(chunk)
         else:
             # This should not happen if validation during loading is correct
-            logging.warning(f"Chunk missing '{section_id_key}' during grouping (Order: {chunk.get('order')}). Skipping.")
+            logging.warning(f"Chunk missing '{section_id_key}' during grouping (Sequence: {chunk.get('sequence_number')}). Skipping.")
 
 
-    logging.debug(f"Grouped {len(chapter_chunks)} chunks into {len(grouped_by_section)} original sections using key '{section_id_key}' (orig_section_num).")
+    logging.debug(f"Grouped {len(chapter_chunks)} chunks into {len(grouped_by_section)} sections using key '{section_id_key}' (section_number).")
     return grouped_by_section
 
 
@@ -659,7 +661,8 @@ def main():
             return
 
     # 4. Iterate through selected chapters
-    for chapter_num in chapters_to_process_keys:
+    # Use tqdm for chapter progress
+    for chapter_num in tqdm(chapters_to_process_keys, desc="Processing Chapters", unit="chapter"):
         chapter_chunks = all_chapters_data[chapter_num]
         logging.info(f"\n===== Processing Chapter: {chapter_num} =====")
 
@@ -679,11 +682,12 @@ def main():
             logging.warning(f"No sections found or grouped for chapter {chapter_num}.")
             continue
 
-        # Determine section order based on the 'order' of the first chunk in each section
+        # Determine section order based on the 'sequence_number' of the first chunk in each section
         section_order_map = {}
         for section_id, chunks in sections_in_chapter_grouped.items():
             if chunks:
-                section_order_map[section_id] = chunks[0].get('order', float('inf')) # Use order of first chunk
+                # Use sequence_number of first chunk for sorting sections
+                section_order_map[section_id] = chunks[0].get('sequence_number', float('inf'))
             else:
                 section_order_map[section_id] = float('inf') # Should not happen if grouping is correct
 
@@ -736,9 +740,10 @@ def main():
                     else:
                         logging.info(f"Section details already exist (with all fields) for '{section_id}' (File: {output_filename}). Skipping generation.")
 
-                    # Optional: Load existing summary for context
-                    if 'section_summary' in existing_data:
-                         recent_section_summaries.append(existing_data['section_summary'])
+                    # Load existing summary for context if skipping generation
+                    existing_summary = existing_data.get('section_summary')
+                    if existing_summary:
+                         recent_section_summaries.append(existing_summary)
                          if len(recent_section_summaries) > MAX_RECENT_SUMMARIES:
                              recent_section_summaries.pop(0) # Remove oldest
 
@@ -768,6 +773,11 @@ def main():
 
             # 11. Save results and update context window
             if section_result:
+                # Ensure the renamed field is present before saving
+                if 'section_importance_score' not in section_result:
+                     logging.warning(f"LLM response for section '{section_id}' missing 'section_importance_score'. Adding default 0.5.")
+                     section_result['section_importance_score'] = 0.5
+
                 try:
                     with open(output_filepath, 'w', encoding='utf-8') as f:
                         json.dump(section_result, f, indent=4)

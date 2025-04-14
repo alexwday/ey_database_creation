@@ -421,9 +421,9 @@ def main():
 
     # 3. Save the potentially modified chunks
     # 3. Save the potentially modified chunks
-    # 4. Add the final 'order' field based on the sorted list
+    # 4. Add the final 'sequence_number' field based on the sorted list
     for i, chunk in enumerate(final_chunks):
-        chunk["order"] = i + 1 # Add 1-based order field
+        chunk["sequence_number"] = i + 1 # Add 1-based sequence number field
 
     # 5. Save the final chunks using their original filenames (preserved in _filename)
     save_chunks(final_chunks, output_dir)
