@@ -557,7 +557,7 @@ def process_chapter_for_sections(
             # Add level_x hierarchy fields from raw data
             **{f"level_{i}": section_raw_data.get(f"level_{i}") for i in range(1, 7) if section_raw_data.get(f"level_{i}")}
         }
-        processed_sections.append(final_section_data)
+        newly_processed_sections.append(final_section_data) # Corrected variable name
 
         # Update recent summaries list for context (only for successfully processed sections)
         if gpt_details and gpt_details.get("section_summary"):
