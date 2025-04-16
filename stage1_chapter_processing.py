@@ -647,21 +647,56 @@ def process_chapter_file(md_file_path: str, client: OpenAI, last_processed_end_p
         return None
 
 
+import sys # Added for sys.exit
+
 def run_stage1():
-    """Main function to execute Stage 1 processing."""
+    """Main function to execute Stage 1 processing with resumability."""
     logging.info("--- Starting Stage 1: Chapter Processing ---")
     create_directory(OUTPUT_DIR)
+    output_filepath = Path(OUTPUT_DIR) / OUTPUT_FILENAME
+
+    # --- Load Existing Data (for Resumability) ---
+    existing_data = []
+    processed_filenames = set()
+    if output_filepath.exists():
+        try:
+            with open(output_filepath, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)
+            if not isinstance(existing_data, list):
+                 logging.warning(f"Existing output file {output_filepath} does not contain a valid list. Starting fresh.")
+                 existing_data = []
+            else:
+                 # Use _source_filename for robust checking
+                 processed_filenames = {chap.get("_source_filename") for chap in existing_data if chap.get("_source_filename")}
+                 logging.info(f"Loaded {len(existing_data)} existing chapter records from {output_filepath}. Found {len(processed_filenames)} previously processed filenames.")
+        except json.JSONDecodeError:
+            logging.error(f"Error decoding JSON from existing output file {output_filepath}. Starting fresh.", exc_info=True)
+            existing_data = []
+            processed_filenames = set()
+        except Exception as e:
+            logging.error(f"Error loading existing output file {output_filepath}: {e}. Starting fresh.", exc_info=True)
+            existing_data = []
+            processed_filenames = set()
 
     # --- Find and Sort Input Files ---
     input_path = Path(INPUT_MD_DIR)
     if not input_path.is_dir():
         logging.error(f"Input directory not found: {INPUT_MD_DIR}")
-        return None # Indicate failure
+        # If existing data was loaded, still save it back? Or just exit?
+        # Let's exit cleanly if input dir is missing.
+        sys.exit(f"Error: Input directory '{INPUT_MD_DIR}' not found.")
 
     markdown_files = list(input_path.glob("*.md"))
     if not markdown_files:
         logging.warning(f"No markdown files found in {INPUT_MD_DIR}.")
-        return [] # Return empty list if no files
+        # Save existing data back if it was loaded, otherwise create empty file
+        try:
+            with open(output_filepath, "w", encoding="utf-8") as f:
+                json.dump(existing_data, f, indent=2, ensure_ascii=False)
+            logging.info(f"No new files to process. Saved {len(existing_data)} existing records back to {output_filepath}")
+        except Exception as e:
+            logging.error(f"Error saving output JSON to {output_filepath}: {e}", exc_info=True)
+        return existing_data # Return existing data
 
     # Sort files naturally if possible
     if natsort:
@@ -674,40 +709,74 @@ def run_stage1():
     # --- Initialize OpenAI Client ---
     client = get_openai_client()
     if not client:
-        logging.warning("OpenAI client initialization failed. Summary/Tag generation will be skipped.")
+        logging.warning("OpenAI client initialization failed. Summary/Tag generation will be skipped for new chapters.")
 
     # --- Process Files ---
-    all_chapter_data = []
-    processed_files_count = 0
-    failed_files_count = 0
-    last_processed_end_page = 0 # Track for page inference
+    newly_processed_data = []
+    processed_this_run_count = 0
+    skipped_count = 0
+    failed_this_run_count = 0
+    # Determine the last page number from existing data to continue inference
+    last_processed_end_page = 0
+    if existing_data:
+        # Sort existing data by chapter number to find the true last page
+        try:
+            sorted_existing = sorted(existing_data, key=lambda x: x.get('chapter_number', 0))
+            if sorted_existing:
+                last_processed_end_page = sorted_existing[-1].get("chapter_page_end", 0)
+        except Exception as e:
+             logging.warning(f"Could not reliably determine last page from existing data: {e}. Page inference might be inaccurate.")
+
+    logging.info(f"Starting processing loop. Last known end page: {last_processed_end_page}")
 
     for md_file in tqdm(markdown_files, desc="Processing Chapters"):
+        file_basename = md_file.name
+        if file_basename in processed_filenames:
+            logging.debug(f"Skipping already processed file: {file_basename}")
+            skipped_count += 1
+            continue # Skip this file
+
+        logging.info(f"Processing new or previously failed file: {file_basename}")
         chapter_result = process_chapter_file(str(md_file), client, last_processed_end_page)
         if chapter_result:
-            all_chapter_data.append(chapter_result)
-            last_processed_end_page = chapter_result.get("chapter_page_end", last_processed_end_page) # Update last page
-            processed_files_count += 1
+            newly_processed_data.append(chapter_result)
+            # Update last_processed_end_page based on the *newly* processed chapter
+            # This assumes chapters are processed roughly in order for page inference
+            last_processed_end_page = chapter_result.get("chapter_page_end", last_processed_end_page)
+            processed_this_run_count += 1
         else:
-            failed_files_count += 1
+            failed_this_run_count += 1
+            # Don't update last_processed_end_page on failure
 
-    # --- Save Output ---
-    output_filepath = Path(OUTPUT_DIR) / OUTPUT_FILENAME
+    # --- Merge and Save Output ---
+    final_data = existing_data + newly_processed_data
+    # Optional: Re-sort final data by chapter number if needed
+    if natsort:
+        try:
+            final_data = sorted(final_data, key=lambda x: x.get('chapter_number', float('inf')))
+            logging.info("Re-sorted final combined data by chapter number.")
+        except Exception as e:
+            logging.warning(f"Could not re-sort final data: {e}")
+
+
     try:
         with open(output_filepath, "w", encoding="utf-8") as f:
-            json.dump(all_chapter_data, f, indent=2, ensure_ascii=False)
-        logging.info(f"Successfully saved {len(all_chapter_data)} chapter data entries to {output_filepath}")
+            json.dump(final_data, f, indent=2, ensure_ascii=False)
+        logging.info(f"Successfully saved {len(final_data)} total chapter data entries to {output_filepath}")
     except Exception as e:
-        logging.error(f"Error saving output JSON to {output_filepath}: {e}", exc_info=True)
+        logging.error(f"Error saving final combined output JSON to {output_filepath}: {e}", exc_info=True)
 
     # --- Print Summary ---
     logging.info("--- Stage 1 Summary ---")
-    logging.info(f"Successfully processed: {processed_files_count} files")
-    logging.info(f"Failed to process    : {failed_files_count} files")
+    logging.info(f"Input files found    : {len(markdown_files)}")
+    logging.info(f"Skipped (already done): {skipped_count}")
+    logging.info(f"Processed this run   : {processed_this_run_count}")
+    logging.info(f"Failed this run      : {failed_this_run_count}")
+    logging.info(f"Total records saved  : {len(final_data)}")
     logging.info(f"Output JSON file     : {output_filepath}")
     logging.info("--- Stage 1 Finished ---")
 
-    return all_chapter_data # Return data for potential chaining in notebook
+    return final_data # Return combined data
 
 # ==============================================================================
 # Main Execution Block
