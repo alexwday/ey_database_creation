@@ -373,13 +373,37 @@ SECTION_TOOL_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "section_summary": {"type": "string", "description": "A concise summary (1-3 sentences) capturing the core topic or purpose of this section."},
-                "section_tags": {"type": "array", "items": {"type": "string"}, "description": "Meaningful keywords or tags specific to this section's content."},
-                "section_standard": {"type": "string", "description": "The primary accounting or reporting standard applicable (e.g., 'IFRS', 'US GAAP', 'N/A')."},
-                "section_standard_codes": {"type": "array", "items": {"type": "string"}, "description": "Specific standard codes explicitly mentioned or directly relevant (e.g., ['IFRS 16', 'IAS 17'])."},
-                "section_importance_score": {"type": "number", "description": "Score 0.0-1.0 indicating section importance relative to the chapter. 0.5 is average/unknown.", "minimum": 0.0, "maximum": 1.0},
-                "section_references": {"type": "array", "items": {"type": "string"}, "description": "Explicit references to other sections/chapters/standards found in the text (e.g., ['See Section 4.5', 'IAS 36.12']). Empty list [] if none."}
+                "section_summary": {
+                    "type": "string",
+                    "description": "A concise summary (1-3 sentences) capturing the core topic or purpose of this section, suitable for reranking search results."
+                },
+                "section_tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "A list of meaningful keywords or tags specific to this section's content, scaled appropriately to the section's length and complexity. These tags will be used as metadata for search reranking."
+                },
+                "section_standard": {
+                    "type": "string",
+                    "description": "The primary accounting or reporting standard applicable to this section (e.g., 'IFRS', 'US GAAP', 'N/A')."
+                },
+                "section_standard_codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "A list of specific standard codes explicitly mentioned or directly relevant in the section (e.g., ['IFRS 16', 'IAS 17']). The number of codes should reflect the section's content. These codes will be used as metadata for search reranking."
+                },
+                "section_importance_score": { # Matches field name in script 8's schema
+                    "type": "number",
+                    "description": "A score between 0.0 (low importance) and 1.0 (high importance) indicating how crucial this section is to understanding the overall chapter's topic. A score of 0.5 indicates average or unknown importance. This float value will be used for search reranking.",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "section_references": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "A list of explicit references to other sections, chapters, or standard codes found within this section's text (e.g., ['See Section 4.5', 'Refer to Chapter 3', 'IAS 36.12']). Provide an empty list [] if none are found. These references provide context."
+                }
             },
+            # Keep required field name as 'section_importance_score' to match script 8's schema
             "required": ["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance_score", "section_references"]
         }
     }
@@ -388,21 +412,45 @@ SECTION_TOOL_SCHEMA = {
 def _build_section_prompt(section_text, chapter_summary, chapter_tags, previous_section_summaries=None):
     """Builds the messages list for the section processing call."""
     if previous_section_summaries is None: previous_section_summaries = []
-    system_prompt = "<role>You are an expert financial reporting specialist.</role><task>Analyze the provided section text within the chapter context. Generate a concise summary, tags, standard info, importance score, and references using the 'extract_section_details' tool.</task><guardrails>Focus on the current section. Base details strictly on provided text and context.</guardrails>"
+
+    # System prompt from script 8
+    system_prompt = """<role>You are an expert financial reporting specialist.</role>
+<source_material>You are analyzing a specific section within a chapter from an EY technical accounting guidance manual. You are provided with the overall chapter summary/tags and summaries of recently processed sections from the same chapter.</source_material>
+<task>Your primary task is to generate a **concise summary (1-3 sentences)** for the current section, suitable for use in reranking search results. Additionally, extract relevant tags, the primary applicable accounting standard, and specific standard codes mentioned. Use the 'extract_section_details' tool for your response.</task>
+<guardrails>Base your analysis strictly on the provided section text and context. Focus on capturing the core topic/purpose concisely for the summary. Ensure tags and standard codes are precise and derived from the section text.</guardrails>"""
+
     user_prompt_elements = ["<prompt>"]
-    user_prompt_elements.append("<style>Concise, factual, keyword-focused summary; technical/precise elsewhere.</style>")
+    # User prompt elements from script 8
+    user_prompt_elements.append("<style>Concise, factual, keyword-focused for summary; technical and precise for other fields.</style>")
+    user_prompt_elements.append("<tone>Professional, objective, expert.</tone>")
+    user_prompt_elements.append("<audience>Accounting professionals needing specific guidance on this section.</audience>")
     user_prompt_elements.append('<response_format>Use the "extract_section_details" tool.</response_format>')
+
     user_prompt_elements.append("<overall_chapter_context>")
     user_prompt_elements.append(f"<chapter_summary>{chapter_summary}</chapter_summary>")
     user_prompt_elements.append(f"<chapter_tags>{json.dumps(chapter_tags)}</chapter_tags>")
     user_prompt_elements.append("</overall_chapter_context>")
+
     if previous_section_summaries:
         user_prompt_elements.append("<recent_section_context>")
-        for i, summary in enumerate(previous_section_summaries): user_prompt_elements.append(f"<previous_section_{i+1}_summary>{summary}</previous_section_{i+1}_summary>")
+        for i, summary in enumerate(previous_section_summaries):
+            user_prompt_elements.append(f"<previous_section_{i+1}_summary>{summary}</previous_section_{i+1}_summary>")
         user_prompt_elements.append("</recent_section_context>")
+
     user_prompt_elements.append(f"<current_section_text>{section_text}</current_section_text>")
+
+    # Instructions block from script 8 (includes 'section_importance' in point 5)
     user_prompt_elements.append("<instructions>")
-    user_prompt_elements.append("Analyze <current_section_text> considering context. Use 'extract_section_details' tool for: 1. section_summary (1-3 sentences, core topic). 2. section_tags (specific keywords). 3. section_standard ('IFRS', 'US GAAP', 'N/A'). 4. section_standard_codes (explicit codes like 'IFRS 16'). 5. section_importance_score (0.0-1.0 float, importance to chapter). 6. section_references (explicit refs like 'See Sec 4.5').")
+    user_prompt_elements.append("""
+    **Analysis Objective:** Analyze the provided <current_section_text> considering the <overall_chapter_context> and <recent_section_context> (if provided).
+    **Action:** Generate the following details for the **current section** using the 'extract_section_details' tool:
+    1.  **section_summary:** A **very concise summary (1-3 sentences)** capturing the core topic or purpose of this section. This summary will be used to help rerank search results, so it should be distinct and informative at a glance.
+    2.  **section_tags:** Generate a list of meaningful, granular tags specific to THIS SECTION's content. The number of tags should be dynamic and reflect the section's complexity and key topics. These tags are crucial metadata for search reranking.
+    3.  **section_standard:** Identify the single, primary accounting standard framework most relevant to THIS SECTION (e.g., 'IFRS', 'US GAAP', 'N/A').
+    4.  **section_standard_codes:** List specific standard codes (e.g., 'IFRS 16', 'IAS 36.12', 'ASC 842-10-15') explicitly mentioned or directly and significantly relevant within THIS SECTION's text. The number of codes should be dynamic, reflecting the section's content. Provide an empty list [] if none are applicable. These codes are crucial metadata for search reranking.
+    5.  **section_importance_score:** Assign a score between 0.0 (low importance) and 1.0 (high importance) representing how crucial this section's content is for understanding the overall topic of the chapter provided in the <overall_chapter_context>. Consider the section's scope and depth relative to the chapter summary. A score of 0.5 indicates average or unknown importance. Provide a float value (e.g., 0.7). This score will directly influence search result ranking.
+    6.  **section_references:** List any explicit textual references made within the <current_section_text> to other sections, chapters, paragraphs, or specific standard codes (e.g., "See Section 4.5", "Refer to Chapter 3", "IAS 36.12"). Provide an empty list [] if no explicit references are found.
+    """)
     user_prompt_elements.append("</instructions>")
     user_prompt_elements.append("</prompt>")
     user_prompt = "\n".join(user_prompt_elements)
@@ -430,7 +478,7 @@ def get_section_details_from_gpt(section_text: str, chapter_details: Dict, previ
 
         parsed_data = parse_gpt_json_response(
             response_content_json_str,
-            expected_keys=["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance_score", "section_references"]
+            expected_keys=["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance_score", "section_references"] # Keep expected key as score
         )
 
         if usage_info:
