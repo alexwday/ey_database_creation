@@ -446,23 +446,62 @@ def get_section_details_from_gpt(section_text: str, chapter_details: Dict, previ
         logging.error(f"Error getting section details from GPT: {e}", exc_info=True)
         return None
 
+import sys # Ensure sys is imported
+
 # ==============================================================================
 # Main Stage 2 Logic
 # ==============================================================================
 
-def process_chapter_for_sections(chapter_data: Dict, client: Optional[OpenAI], recent_section_summaries: List[str]) -> List[Dict]:
-    """Identifies, enriches, and assembles section data for a single chapter."""
+# Helper function to create a unique ID for a section
+def _create_section_id(section_data: Dict) -> Optional[str]:
+    """Creates a unique identifier string for a section."""
+    doc_id = section_data.get("document_id")
+    chap_num = section_data.get("chapter_number")
+    sec_num = section_data.get("section_number")
+    if doc_id is not None and chap_num is not None and sec_num is not None:
+        return f"{doc_id}::{chap_num}::{sec_num}"
+    return None # Return None if essential parts are missing
+
+def process_chapter_for_sections(
+    chapter_data: Dict,
+    client: Optional[OpenAI],
+    processed_section_ids: set[str] # Added: Set of already processed IDs
+    ) -> List[Dict]:
+    """
+    Identifies, enriches, and assembles section data for a single chapter,
+    skipping sections that have already been processed.
+    Returns only the newly processed sections for this chapter.
+    """
     chapter_number = chapter_data.get("chapter_number", "UNKNOWN")
+    document_id = chapter_data.get("document_id", "UNKNOWN_DOC") # Get doc_id for ID creation
     logging.info(f"Processing sections for Chapter {chapter_number}...")
-    processed_sections = []
+    newly_processed_sections = [] # Store only sections processed in this run
+    recent_section_summaries = [] # Context for GPT within this chapter run
 
     initial_sections = split_chapter_into_sections(chapter_data)
-    logging.info(f"  Identified {len(initial_sections)} initial sections.")
+    logging.info(f"  Identified {len(initial_sections)} initial sections for Chapter {chapter_number}.")
+    skipped_count = 0
 
     for section_raw_data in tqdm(initial_sections, desc=f"Chapter {chapter_number} Sections"):
         section_number = section_raw_data["section_number"]
-        logging.debug(f"  Processing Section {section_number} ('{section_raw_data.get('section_title', '')[:30]}...')")
 
+        # --- Check if already processed ---
+        # Create a temporary dict to pass to the ID function
+        temp_id_data = {
+            "document_id": document_id,
+            "chapter_number": chapter_number,
+            "section_number": section_number
+        }
+        section_id = _create_section_id(temp_id_data)
+
+        if section_id and section_id in processed_section_ids:
+            logging.debug(f"  Skipping already processed section: {section_id}")
+            skipped_count += 1
+            continue # Skip this section
+
+        logging.debug(f"  Processing Section {section_id} ('{section_raw_data.get('section_title', '')[:30]}...')")
+
+        # --- Process Section (if not skipped) ---
         # Clean content and calculate tokens
         raw_slice = section_raw_data["raw_section_slice"]
         cleaned_content = clean_azure_tags(raw_slice)
@@ -520,37 +559,71 @@ def process_chapter_for_sections(chapter_data: Dict, client: Optional[OpenAI], r
         }
         processed_sections.append(final_section_data)
 
-        # Update recent summaries list for context
+        # Update recent summaries list for context (only for successfully processed sections)
         if gpt_details and gpt_details.get("section_summary"):
             recent_section_summaries.append(gpt_details["section_summary"])
-            # Keep only the last N summaries
-            # No need to pop here, slicing [-N:] handles it in the next call
+            # Keep only the last N summaries (handled by slicing in _build_section_prompt)
 
-    logging.info(f"  Finished processing {len(processed_sections)} sections for Chapter {chapter_number}.")
-    return processed_sections
+    if skipped_count > 0:
+        logging.info(f"  Skipped {skipped_count} already processed sections in Chapter {chapter_number}.")
+    logging.info(f"  Finished processing. Generated {len(newly_processed_sections)} new section records for Chapter {chapter_number}.")
+    return newly_processed_sections # Return only the sections processed in this run
 
 
 def run_stage2():
-    """Main function to execute Stage 2 processing."""
+    """Main function to execute Stage 2 processing with resumability."""
     logging.info("--- Starting Stage 2: Section Identification & Enrichment ---")
     create_directory(OUTPUT_DIR)
+    output_filepath = Path(OUTPUT_DIR) / OUTPUT_FILENAME
+
+    # --- Load Existing Stage 2 Data (for Resumability) ---
+    existing_section_data = []
+    processed_section_ids = set()
+    if output_filepath.exists():
+        try:
+            with open(output_filepath, "r", encoding="utf-8") as f:
+                existing_section_data = json.load(f)
+            if not isinstance(existing_section_data, list):
+                 logging.warning(f"Existing output file {output_filepath} does not contain a valid list. Starting fresh.")
+                 existing_section_data = []
+            else:
+                 # Create IDs for existing sections
+                 for sec_data in existing_section_data:
+                     sec_id = _create_section_id(sec_data)
+                     if sec_id: processed_section_ids.add(sec_id)
+                 logging.info(f"Loaded {len(existing_section_data)} existing section records from {output_filepath}. Found {len(processed_section_ids)} unique processed section IDs.")
+        except json.JSONDecodeError:
+            logging.error(f"Error decoding JSON from {output_filepath}. Starting fresh.", exc_info=True)
+            existing_section_data = []; processed_section_ids = set()
+        except Exception as e:
+            logging.error(f"Error loading existing data from {output_filepath}: {e}. Starting fresh.", exc_info=True)
+            existing_section_data = []; processed_section_ids = set()
 
     # --- Load Stage 1 Data ---
     stage1_output_file = Path(STAGE1_OUTPUT_DIR) / STAGE1_FILENAME
     if not stage1_output_file.exists():
-        logging.error(f"Stage 1 output file not found: {stage1_output_file}")
-        return None
+        logging.error(f"Stage 1 output file not found: {stage1_output_file}. Cannot proceed.")
+        # Exit if stage 1 data is missing
+        sys.exit(f"Error: Stage 1 output file '{stage1_output_file}' not found.")
     try:
         with open(stage1_output_file, "r", encoding="utf-8") as f:
             all_chapter_data = json.load(f)
         logging.info(f"Loaded {len(all_chapter_data)} chapters from {stage1_output_file}")
     except Exception as e:
         logging.error(f"Error loading Stage 1 data from {stage1_output_file}: {e}", exc_info=True)
-        return None
+        # Exit if stage 1 data is unloadable
+        sys.exit(f"Error: Failed to load Stage 1 data from '{stage1_output_file}'.")
 
     if not all_chapter_data:
         logging.warning("Stage 1 data is empty. No sections to process.")
-        return []
+        # Save existing data back if it was loaded, otherwise create empty file
+        try:
+            with open(output_filepath, "w", encoding="utf-8") as f:
+                json.dump(existing_section_data, f, indent=2, ensure_ascii=False)
+            logging.info(f"No chapters to process. Saved {len(existing_section_data)} existing section records back to {output_filepath}")
+        except Exception as e:
+            logging.error(f"Error saving output JSON to {output_filepath}: {e}", exc_info=True)
+        return existing_section_data # Return existing data
 
     # --- Initialize OpenAI Client ---
     client = get_openai_client()
@@ -558,31 +631,80 @@ def run_stage2():
         logging.warning("OpenAI client initialization failed. Section enrichment will be skipped.")
 
     # --- Process Chapters for Sections ---
-    all_section_data = []
-    recent_section_summaries = [] # Maintain across chapters for potential global context? No, reset per chapter.
+    # 'existing_section_data' will accumulate results
+    total_new_sections_processed = 0
+    total_sections_failed_this_run = 0 # Track failures if needed later
 
     for chapter_data in tqdm(all_chapter_data, desc="Processing Chapters for Sections"):
-        # Reset summary context for each new chapter
-        chapter_sections = process_chapter_for_sections(chapter_data, client, [])
-        all_section_data.extend(chapter_sections)
+        chapter_number = chapter_data.get("chapter_number", "UNKNOWN")
+        # Pass the set of processed IDs to the chapter processing function
+        newly_processed_chapter_sections = process_chapter_for_sections(
+            chapter_data, client, processed_section_ids
+        )
 
-    # --- Save Output ---
-    output_filepath = Path(OUTPUT_DIR) / OUTPUT_FILENAME
+        if newly_processed_chapter_sections:
+            # Add newly processed sections to the main list
+            existing_section_data.extend(newly_processed_chapter_sections)
+            total_new_sections_processed += len(newly_processed_chapter_sections)
+            # Update the set of processed IDs
+            for sec_data in newly_processed_chapter_sections:
+                sec_id = _create_section_id(sec_data)
+                if sec_id: processed_section_ids.add(sec_id)
+
+            # --- Incremental Save (after each chapter) ---
+            try:
+                # Sort before saving incrementally
+                temp_sorted_data = existing_section_data
+                if natsort:
+                    try:
+                        # Sort by chapter then section number
+                        temp_sorted_data = sorted(existing_section_data, key=lambda x: (x.get('chapter_number', float('inf')), x.get('section_number', float('inf'))))
+                    except Exception as sort_e:
+                        logging.warning(f"Could not sort data before incremental save for chapter {chapter_number}: {sort_e}. Saving in current order.")
+                        temp_sorted_data = existing_section_data # Fallback
+
+                with open(output_filepath, "w", encoding="utf-8") as f:
+                    json.dump(temp_sorted_data, f, indent=2, ensure_ascii=False)
+                logging.debug(f"Incrementally saved {len(temp_sorted_data)} total section records after processing Chapter {chapter_number}")
+                existing_section_data = temp_sorted_data # Update main list with sorted version
+
+            except Exception as e:
+                logging.error(f"Error during incremental save to {output_filepath} after processing Chapter {chapter_number}: {e}", exc_info=True)
+                # Continue processing other chapters
+
+    # --- Final Sort and Save ---
+    logging.info("Performing final sort and save...")
+    final_data_to_save = existing_section_data
+    if natsort:
+        try:
+            final_data_to_save = sorted(existing_section_data, key=lambda x: (x.get('chapter_number', float('inf')), x.get('section_number', float('inf'))))
+            logging.info("Performed final sort of section data.")
+        except Exception as final_sort_e:
+            logging.warning(f"Could not perform final sort: {final_sort_e}. Saving potentially unsorted data.")
+            final_data_to_save = existing_section_data # Fallback
+    else:
+        logging.info("natsort not available, skipping final sort.")
+
     try:
         with open(output_filepath, "w", encoding="utf-8") as f:
-            json.dump(all_section_data, f, indent=2, ensure_ascii=False)
-        logging.info(f"Successfully saved {len(all_section_data)} section data entries to {output_filepath}")
+            json.dump(final_data_to_save, f, indent=2, ensure_ascii=False)
+        logging.info(f"Saved final data with {len(final_data_to_save)} section records to {output_filepath}")
     except Exception as e:
-        logging.error(f"Error saving output JSON to {output_filepath}: {e}", exc_info=True)
+        logging.error(f"Error saving final output JSON to {output_filepath}: {e}", exc_info=True)
+
 
     # --- Print Summary ---
+    final_record_count = len(final_data_to_save) # Use the length of the final list
     logging.info("--- Stage 2 Summary ---")
-    logging.info(f"Total chapters processed: {len(all_chapter_data)}")
-    logging.info(f"Total sections generated: {len(all_section_data)}")
-    logging.info(f"Output JSON file      : {output_filepath}")
+    logging.info(f"Total chapters from Stage 1: {len(all_chapter_data)}")
+    # Note: Skipped count is logged per chapter now. Calculating total skipped requires summing across chapters or re-checking against input.
+    logging.info(f"New sections processed this run: {total_new_sections_processed}")
+    # logging.info(f"Sections failed this run: {total_sections_failed_this_run}") # Add if failure tracking is implemented
+    logging.info(f"Total sections in final file : {final_record_count}")
+    logging.info(f"Output JSON file             : {output_filepath}")
     logging.info("--- Stage 2 Finished ---")
 
-    return all_section_data # Return data for potential chaining
+    return final_data_to_save # Return the final data
 
 # ==============================================================================
 # Main Execution Block
