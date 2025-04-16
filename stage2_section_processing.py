@@ -178,54 +178,59 @@ def get_openai_client(base_url=BASE_URL) -> Optional[OpenAI]:
     except Exception as e:
         logging.error(f"Error creating OpenAI client: {e}", exc_info=True); return None
 
-# --- API Call ---
-def _call_gpt_with_retry(client, model, messages, max_tokens, temperature, tools=None, tool_choice=None):
-    """Makes the API call with retry logic."""
-    last_exception = None
-    for attempt in range(API_RETRY_ATTEMPTS):
-        try:
-            logging.debug(f"Making API call (Attempt {attempt + 1}/{API_RETRY_ATTEMPTS})...")
-            completion_kwargs = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
-            if tools and tool_choice:
-                completion_kwargs["tools"] = tools; completion_kwargs["tool_choice"] = tool_choice
-                logging.debug("Making API call with tool choice...")
-            else: completion_kwargs["response_format"] = {"type": "json_object"}; logging.debug("Making API call with JSON response format...")
+# --- API Call (Single Attempt) ---
+# Renamed from _call_gpt_with_retry to reflect single attempt nature
+def _call_gpt_single_attempt(client, model, messages, max_tokens, temperature, tools=None, tool_choice=None):
+    """Makes a single API call attempt."""
+    logging.debug("Making single API call attempt...")
+    completion_kwargs = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
+    if tools and tool_choice:
+        completion_kwargs["tools"] = tools; completion_kwargs["tool_choice"] = tool_choice
+        logging.debug("Making API call with tool choice...")
+    else:
+        # This function now expects tool use based on how get_section_details_from_gpt uses it
+        if not tools or not tool_choice:
+             logging.warning("API call initiated without explicit tool choice - this function expects tool use.")
+        completion_kwargs["tools"] = tools # Still send tools if provided
+        # completion_kwargs["response_format"] = {"type": "json_object"} # Use if not using tools
 
-            response = client.chat.completions.create(**completion_kwargs)
-            logging.debug("API call successful.")
-            response_message = response.choices[0].message; usage_info = response.usage
+    # No try/except here, let exceptions propagate up to the caller (get_section_details_from_gpt)
+    response = client.chat.completions.create(**completion_kwargs)
+    logging.debug("API call successful.")
+    response_message = response.choices[0].message; usage_info = response.usage
 
-            if response_message.tool_calls:
-                tool_call = response_message.tool_calls[0]
-                if tool_choice and isinstance(tool_choice, dict):
-                    expected_tool_name = tool_choice.get("function", {}).get("name")
-                    if expected_tool_name and tool_call.function.name != expected_tool_name: raise ValueError(f"Expected tool '{expected_tool_name}' but received '{tool_call.function.name}'")
-                return tool_call.function.arguments, usage_info
-            elif response_message.content: return response_message.content, usage_info
-            else: raise ValueError("API response missing both tool calls and content.")
-        except APIError as e:
-            logging.warning(f"API Error on attempt {attempt + 1}: {e}"); last_exception = e; time.sleep(API_RETRY_DELAY * (attempt + 1))
-        except Exception as e:
-            logging.warning(f"Non-API Error on attempt {attempt + 1}: {e}", exc_info=True); last_exception = e; time.sleep(API_RETRY_DELAY)
-    logging.error(f"API call failed after {API_RETRY_ATTEMPTS} attempts.")
-    if last_exception: raise last_exception
-    else: raise Exception("API call failed for unknown reasons.")
+    if response_message.tool_calls:
+        tool_call = response_message.tool_calls[0]
+        # Basic validation can still happen here or be deferred to parser
+        if tool_choice and isinstance(tool_choice, dict):
+            expected_tool_name = tool_choice.get("function", {}).get("name")
+            if expected_tool_name and tool_call.function.name != expected_tool_name:
+                raise ValueError(f"Expected tool '{expected_tool_name}' but received '{tool_call.function.name}'")
+        return tool_call.function.arguments, usage_info # Return JSON string from tool arguments
+    elif response_message.content:
+        # If content is returned instead of tool_calls, return it for the parser to handle
+        logging.warning("API response contained content instead of expected tool_calls.")
+        return response_message.content, usage_info
+    else:
+        raise ValueError("API response missing both tool calls and content.")
 
 def parse_gpt_json_response(response_content_str: str, expected_keys: List[str]) -> Optional[Dict]:
-    """Parses JSON response string from GPT and validates expected keys."""
-    try:
-        if response_content_str.strip().startswith("```json"): response_content_str = response_content_str.strip()[7:-3].strip()
-        elif response_content_str.strip().startswith("```"): response_content_str = response_content_str.strip()[3:-3].strip()
-        data = json.loads(response_content_str)
-        if not isinstance(data, dict): raise ValueError("Response is not a JSON object.")
-        missing_keys = [key for key in expected_keys if key not in data]
-        if missing_keys: raise ValueError(f"Missing expected keys: {', '.join(missing_keys)}")
-        logging.debug("GPT JSON response parsed successfully.")
-        return data
-    except json.JSONDecodeError as e:
-        logging.error(f"Error decoding GPT JSON: {e}\nRaw response: {response_content_str[:500]}..."); return None
-    except ValueError as e:
-        logging.error(f"Error validating GPT JSON: {e}\nRaw response: {response_content_str[:500]}..."); return None
+    """Parses JSON response string from GPT and validates expected keys. Raises exceptions on failure."""
+    # Removed the unnecessary try block
+    if response_content_str.strip().startswith("```json"): response_content_str = response_content_str.strip()[7:-3].strip()
+    elif response_content_str.strip().startswith("```"): response_content_str = response_content_str.strip()[3:-3].strip()
+    data = json.loads(response_content_str)
+    # Corrected indentation for the following lines
+    if not isinstance(data, dict): raise ValueError("Response is not a JSON object.")
+    missing_keys = [key for key in expected_keys if key not in data]
+    if missing_keys: raise ValueError(f"Missing expected keys: {', '.join(missing_keys)}")
+    logging.debug("GPT JSON response parsed successfully.")
+    return data
+    # Let exceptions propagate up to the caller (get_section_details_from_gpt)
+    # except json.JSONDecodeError as e:
+    #     logging.error(f"Error decoding GPT JSON: {e}\nRaw response: {response_content_str[:500]}..."); return None
+    # except ValueError as e:
+    #     logging.error(f"Error validating GPT JSON: {e}\nRaw response: {response_content_str[:500]}..."); return None
 
 # --- File/Path Utils ---
 def create_directory(directory: str):
@@ -468,31 +473,58 @@ def get_section_details_from_gpt(section_text: str, chapter_details: Dict, previ
     prompt_tokens_est = sum(count_tokens(msg["content"]) for msg in messages)
     logging.debug(f"Estimated prompt tokens for section enrichment: {prompt_tokens_est}")
 
-    try:
-        response_content_json_str, usage_info = _call_gpt_with_retry(
-            client, MODEL_NAME_CHAT, messages, MAX_COMPLETION_TOKENS_SECTION, TEMPERATURE,
-            tools=[SECTION_TOOL_SCHEMA],
-            tool_choice={"type": "function", "function": {"name": "extract_section_details"}}
-        )
-        if not response_content_json_str: raise ValueError("API call returned empty response.")
+    last_exception = None
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            logging.debug(f"Attempt {attempt + 1}/{API_RETRY_ATTEMPTS} to get and parse details for section...")
+            # 1. Call API (single attempt)
+            response_content_json_str, usage_info = _call_gpt_single_attempt(
+                client, MODEL_NAME_CHAT, messages, MAX_COMPLETION_TOKENS_SECTION, TEMPERATURE,
+                tools=[SECTION_TOOL_SCHEMA],
+                tool_choice={"type": "function", "function": {"name": "extract_section_details"}}
+            )
+            if not response_content_json_str:
+                raise ValueError("API call returned empty response content.")
 
-        parsed_data = parse_gpt_json_response(
-            response_content_json_str,
-            expected_keys=["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance_score", "section_references"] # Keep expected key as score
-        )
+            # 2. Parse Response (raises exception on failure)
+            parsed_data = parse_gpt_json_response(
+                response_content_json_str,
+                expected_keys=["section_summary", "section_tags", "section_standard", "section_standard_codes", "section_importance_score", "section_references"]
+            )
 
-        if usage_info:
-             prompt_tokens = usage_info.prompt_tokens; completion_tokens = usage_info.completion_tokens
-             total_tokens = usage_info.total_tokens
-             total_cost = (prompt_tokens / 1000 * PROMPT_TOKEN_COST) + (completion_tokens / 1000 * COMPLETION_TOKEN_COST)
-             logging.info(f"API Usage (Section Details) - Prompt: {prompt_tokens}, Completion: {completion_tokens}, Total: {total_tokens}, Cost: ${total_cost:.4f}")
-        else: logging.debug("Usage information not available.")
+            # 3. Log usage and return data if successful
+            if usage_info:
+                 prompt_tokens = usage_info.prompt_tokens; completion_tokens = usage_info.completion_tokens
+                 total_tokens = usage_info.total_tokens
+                 total_cost = (prompt_tokens / 1000 * PROMPT_TOKEN_COST) + (completion_tokens / 1000 * COMPLETION_TOKEN_COST)
+                 # Changed to DEBUG to reduce console noise
+                 logging.debug(f"API Usage (Section Details) - Prompt: {prompt_tokens}, Completion: {completion_tokens}, Total: {total_tokens}, Cost: ${total_cost:.4f}")
+            else:
+                 logging.debug("Usage information not available.")
 
-        return parsed_data
+            return parsed_data # Success! Exit loop and return.
 
-    except Exception as e:
-        logging.error(f"Error getting section details from GPT: {e}", exc_info=True)
-        return None
+        except (APIError, requests.exceptions.RequestException) as e:
+            logging.warning(f"API communication error on attempt {attempt + 1}: {e}")
+            last_exception = e
+            time.sleep(API_RETRY_DELAY * (attempt + 1)) # Exponential backoff for API errors
+        except (json.JSONDecodeError, ValueError) as e:
+             logging.warning(f"Parsing/Validation error on attempt {attempt + 1}: {e}")
+             # Log raw response if possible (might be large)
+             if 'response_content_json_str' in locals() and response_content_json_str:
+                 logging.warning(f"Raw response snippet: {response_content_json_str[:500]}...")
+             last_exception = e
+             time.sleep(API_RETRY_DELAY) # Simple delay for parsing errors
+        except Exception as e:
+            logging.error(f"Unexpected error on attempt {attempt + 1}: {e}", exc_info=True)
+            last_exception = e
+            time.sleep(API_RETRY_DELAY) # Simple delay for unexpected errors
+
+    # If loop finishes without returning, all attempts failed
+    logging.error(f"Failed to get valid section details after {API_RETRY_ATTEMPTS} attempts.")
+    if last_exception:
+        logging.error(f"Last error encountered: {last_exception}")
+    return None # Indicate failure
 
 import sys # Ensure sys is imported
 
@@ -508,49 +540,70 @@ def _create_section_id(section_data: Dict) -> Optional[str]:
     sec_num = section_data.get("section_number")
     if doc_id is not None and chap_num is not None and sec_num is not None:
         return f"{doc_id}::{chap_num}::{sec_num}"
+    logging.warning(f"Could not create section ID from data: {section_data.get('section_title', 'Unknown Section')}")
     return None # Return None if essential parts are missing
 
 def process_chapter_for_sections(
     chapter_data: Dict,
     client: Optional[OpenAI],
-    processed_section_ids: set[str] # Added: Set of already processed IDs
+    existing_section_details: Dict[str, Dict] # Changed: Pass dict of existing details
     ) -> List[Dict]:
     """
-    Identifies, enriches, and assembles section data for a single chapter,
-    skipping sections that have already been processed.
-    Returns only the newly processed sections for this chapter.
+    Identifies, enriches, and assembles section data for a single chapter.
+    Retries sections if they exist in existing_section_details but lack enrichment.
+    Returns a list of all section data dictionaries for this chapter (new, retried, or existing valid).
     """
     chapter_number = chapter_data.get("chapter_number", "UNKNOWN")
     document_id = chapter_data.get("document_id", "UNKNOWN_DOC") # Get doc_id for ID creation
     logging.info(f"Processing sections for Chapter {chapter_number}...")
-    newly_processed_sections = [] # Store only sections processed in this run
+    processed_chapter_sections = [] # Store all sections for this chapter
     recent_section_summaries = [] # Context for GPT within this chapter run
 
     initial_sections = split_chapter_into_sections(chapter_data)
     logging.info(f"  Identified {len(initial_sections)} initial sections for Chapter {chapter_number}.")
-    skipped_count = 0
+    skipped_fully_processed_count = 0
+    retried_count = 0
+    newly_processed_count = 0
+    failed_processing_count = 0
 
     for section_raw_data in tqdm(initial_sections, desc=f"Chapter {chapter_number} Sections"):
         section_number = section_raw_data["section_number"]
+        section_title = section_raw_data.get('section_title', 'Unknown Title')
 
-        # --- Check if already processed ---
-        # Create a temporary dict to pass to the ID function
-        temp_id_data = {
-            "document_id": document_id,
-            "chapter_number": chapter_number,
-            "section_number": section_number
-        }
+        # Create ID for checking/storing
+        temp_id_data = {"document_id": document_id, "chapter_number": chapter_number, "section_number": section_number}
         section_id = _create_section_id(temp_id_data)
+        if not section_id:
+            logging.warning(f"Could not generate ID for section {section_number} ('{section_title[:30]}...'). Skipping.")
+            failed_processing_count += 1
+            continue
 
-        if section_id and section_id in processed_section_ids:
-            logging.debug(f"  Skipping already processed section: {section_id}")
-            skipped_count += 1
-            continue # Skip this section
+        # --- Check existing data ---
+        existing_record = existing_section_details.get(section_id)
+        needs_processing = True
+        if existing_record:
+            # Check if enrichment exists (using section_summary as a proxy)
+            if existing_record.get("section_summary") is not None:
+                logging.debug(f"  Section {section_id} already processed with enrichment. Skipping.")
+                processed_chapter_sections.append(existing_record) # Add existing valid record
+                # Update context window even if skipped
+                if existing_record.get("section_summary"):
+                    recent_section_summaries.append(existing_record["section_summary"])
+                skipped_fully_processed_count += 1
+                needs_processing = False
+            else:
+                # Changed to DEBUG to reduce console noise
+                logging.debug(f"  Section {section_id} found with missing enrichment. Retrying processing.")
+                retried_count += 1
+        else:
+             logging.debug(f"  Section {section_id} not found in existing data. Processing as new.")
+             newly_processed_count += 1
 
-        logging.debug(f"  Processing Section {section_id} ('{section_raw_data.get('section_title', '')[:30]}...')")
+        if not needs_processing:
+            continue # Go to next section in initial_sections
 
-        # --- Process Section (if not skipped) ---
-        # Clean content and calculate tokens
+        # --- Process Section (New or Retry) ---
+        logging.debug(f"  Processing Section {section_id} ('{section_title[:30]}...')")
         raw_slice = section_raw_data["raw_section_slice"]
         cleaned_content = clean_azure_tags(raw_slice)
         section_token_count = count_tokens(cleaned_content)
@@ -605,17 +658,23 @@ def process_chapter_for_sections(
             # Add level_x hierarchy fields from raw data
             **{f"level_{i}": section_raw_data.get(f"level_{i}") for i in range(1, 7) if section_raw_data.get(f"level_{i}")}
         }
-        newly_processed_sections.append(final_section_data) # Corrected variable name
+        processed_chapter_sections.append(final_section_data) # Add the processed data
 
-        # Update recent summaries list for context (only for successfully processed sections)
-        if gpt_details and gpt_details.get("section_summary"):
-            recent_section_summaries.append(gpt_details["section_summary"])
-            # Keep only the last N summaries (handled by slicing in _build_section_prompt)
+        # Update recent summaries list for context (use summary from final_section_data)
+        current_summary = final_section_data.get("section_summary")
+        if current_summary: # Only add if enrichment was successful (not None)
+            recent_section_summaries.append(current_summary)
+            # Keep only the last N summaries
+            if len(recent_section_summaries) > MAX_RECENT_SUMMARIES_CONTEXT:
+                recent_section_summaries.pop(0)
+        elif gpt_details is None: # Log if enrichment failed
+             failed_processing_count += 1
+             logging.warning(f"  Failed to get enrichment for section {section_id} after retries.")
 
-    if skipped_count > 0:
-        logging.info(f"  Skipped {skipped_count} already processed sections in Chapter {chapter_number}.")
-    logging.info(f"  Finished processing. Generated {len(newly_processed_sections)} new section records for Chapter {chapter_number}.")
-    return newly_processed_sections # Return only the sections processed in this run
+
+    # Log chapter summary
+    logging.info(f"  Chapter {chapter_number} Summary: Skipped={skipped_fully_processed_count}, Retried={retried_count}, New={newly_processed_count}, Failed={failed_processing_count}")
+    return processed_chapter_sections # Return all sections processed/retrieved for this chapter
 
 
 def run_stage2():
@@ -625,27 +684,28 @@ def run_stage2():
     output_filepath = Path(OUTPUT_DIR) / OUTPUT_FILENAME
 
     # --- Load Existing Stage 2 Data (for Resumability) ---
-    existing_section_data = []
-    processed_section_ids = set()
+    existing_section_details = {} # Store as dict: {section_id: section_data}
     if output_filepath.exists():
         try:
             with open(output_filepath, "r", encoding="utf-8") as f:
-                existing_section_data = json.load(f)
-            if not isinstance(existing_section_data, list):
+                existing_data_list = json.load(f)
+            if not isinstance(existing_data_list, list):
                  logging.warning(f"Existing output file {output_filepath} does not contain a valid list. Starting fresh.")
-                 existing_section_data = []
             else:
-                 # Create IDs for existing sections
-                 for sec_data in existing_section_data:
+                 # Populate the dictionary, creating IDs
+                 count = 0
+                 for sec_data in existing_data_list:
                      sec_id = _create_section_id(sec_data)
-                     if sec_id: processed_section_ids.add(sec_id)
-                 logging.info(f"Loaded {len(existing_section_data)} existing section records from {output_filepath}. Found {len(processed_section_ids)} unique processed section IDs.")
+                     if sec_id:
+                         existing_section_details[sec_id] = sec_data
+                         count += 1
+                 logging.info(f"Loaded {count} existing section records into map from {output_filepath}.")
         except json.JSONDecodeError:
             logging.error(f"Error decoding JSON from {output_filepath}. Starting fresh.", exc_info=True)
-            existing_section_data = []; processed_section_ids = set()
+            existing_section_details = {}
         except Exception as e:
             logging.error(f"Error loading existing data from {output_filepath}: {e}. Starting fresh.", exc_info=True)
-            existing_section_data = []; processed_section_ids = set()
+            existing_section_details = {}
 
     # --- Load Stage 1 Data ---
     stage1_output_file = Path(STAGE1_OUTPUT_DIR) / STAGE1_FILENAME
@@ -664,14 +724,15 @@ def run_stage2():
 
     if not all_chapter_data:
         logging.warning("Stage 1 data is empty. No sections to process.")
-        # Save existing data back if it was loaded, otherwise create empty file
+        # Save the potentially loaded (but empty) existing data back
         try:
             with open(output_filepath, "w", encoding="utf-8") as f:
-                json.dump(existing_section_data, f, indent=2, ensure_ascii=False)
-            logging.info(f"No chapters to process. Saved {len(existing_section_data)} existing section records back to {output_filepath}")
+                # Save values from the map as a list
+                json.dump(list(existing_section_details.values()), f, indent=2, ensure_ascii=False)
+            logging.info(f"No chapters to process. Saved {len(existing_section_details)} existing section records back to {output_filepath}")
         except Exception as e:
             logging.error(f"Error saving output JSON to {output_filepath}: {e}", exc_info=True)
-        return existing_section_data # Return existing data
+        return list(existing_section_details.values()) # Return list
 
     # --- Initialize OpenAI Client ---
     client = get_openai_client()
@@ -679,57 +740,35 @@ def run_stage2():
         logging.warning("OpenAI client initialization failed. Section enrichment will be skipped.")
 
     # --- Process Chapters for Sections ---
-    # 'existing_section_data' will accumulate results
-    total_new_sections_processed = 0
-    total_sections_failed_this_run = 0 # Track failures if needed later
+    all_processed_sections_list = [] # Collect results from all chapters here
+    total_sections_processed_run = 0
+    total_sections_failed_run = 0
+    total_sections_skipped_run = 0
 
     for chapter_data in tqdm(all_chapter_data, desc="Processing Chapters for Sections"):
-        chapter_number = chapter_data.get("chapter_number", "UNKNOWN")
-        # Pass the set of processed IDs to the chapter processing function
-        newly_processed_chapter_sections = process_chapter_for_sections(
-            chapter_data, client, processed_section_ids
+        # Pass the dictionary of existing details for checking/retrying
+        chapter_results = process_chapter_for_sections(
+            chapter_data, client, existing_section_details
         )
+        all_processed_sections_list.extend(chapter_results)
 
-        if newly_processed_chapter_sections:
-            # Add newly processed sections to the main list
-            existing_section_data.extend(newly_processed_chapter_sections)
-            total_new_sections_processed += len(newly_processed_chapter_sections)
-            # Update the set of processed IDs
-            for sec_data in newly_processed_chapter_sections:
-                sec_id = _create_section_id(sec_data)
-                if sec_id: processed_section_ids.add(sec_id)
-
-            # --- Incremental Save (after each chapter) ---
-            try:
-                # Sort before saving incrementally
-                temp_sorted_data = existing_section_data
-                if natsort:
-                    try:
-                        # Sort by chapter then section number
-                        temp_sorted_data = sorted(existing_section_data, key=lambda x: (x.get('chapter_number', float('inf')), x.get('section_number', float('inf'))))
-                    except Exception as sort_e:
-                        logging.warning(f"Could not sort data before incremental save for chapter {chapter_number}: {sort_e}. Saving in current order.")
-                        temp_sorted_data = existing_section_data # Fallback
-
-                with open(output_filepath, "w", encoding="utf-8") as f:
-                    json.dump(temp_sorted_data, f, indent=2, ensure_ascii=False)
-                logging.debug(f"Incrementally saved {len(temp_sorted_data)} total section records after processing Chapter {chapter_number}")
-                existing_section_data = temp_sorted_data # Update main list with sorted version
-
-            except Exception as e:
-                logging.error(f"Error during incremental save to {output_filepath} after processing Chapter {chapter_number}: {e}", exc_info=True)
-                # Continue processing other chapters
+        # Optional: Update counts based on logs/return values if needed for final summary
+        # This requires process_chapter_for_sections to return counts or parse logs
 
     # --- Final Sort and Save ---
     logging.info("Performing final sort and save...")
-    final_data_to_save = existing_section_data
+    final_data_to_save = all_processed_sections_list # Already a list
     if natsort:
         try:
-            final_data_to_save = sorted(existing_section_data, key=lambda x: (x.get('chapter_number', float('inf')), x.get('section_number', float('inf'))))
+            # Sort by chapter then section number
+            final_data_to_save = sorted(all_processed_sections_list, key=lambda x: (
+                x.get('chapter_number', float('inf')),
+                x.get('section_number', float('inf'))
+            ))
             logging.info("Performed final sort of section data.")
         except Exception as final_sort_e:
             logging.warning(f"Could not perform final sort: {final_sort_e}. Saving potentially unsorted data.")
-            final_data_to_save = existing_section_data # Fallback
+            # Keep final_data_to_save as the unsorted list
     else:
         logging.info("natsort not available, skipping final sort.")
 
@@ -742,17 +781,16 @@ def run_stage2():
 
 
     # --- Print Summary ---
-    final_record_count = len(final_data_to_save) # Use the length of the final list
+    final_record_count = len(final_data_to_save)
+    # TODO: Enhance summary by tracking processed/failed/skipped counts more accurately if needed
     logging.info("--- Stage 2 Summary ---")
     logging.info(f"Total chapters from Stage 1: {len(all_chapter_data)}")
-    # Note: Skipped count is logged per chapter now. Calculating total skipped requires summing across chapters or re-checking against input.
-    logging.info(f"New sections processed this run: {total_new_sections_processed}")
-    # logging.info(f"Sections failed this run: {total_sections_failed_this_run}") # Add if failure tracking is implemented
     logging.info(f"Total sections in final file : {final_record_count}")
+    # Add more detailed counts here if implemented
     logging.info(f"Output JSON file             : {output_filepath}")
     logging.info("--- Stage 2 Finished ---")
 
-    return final_data_to_save # Return the final data
+    return final_data_to_save # Return the final data list
 
 # ==============================================================================
 # Main Execution Block
