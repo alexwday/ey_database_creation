@@ -203,7 +203,7 @@ def get_openai_client(base_url=BASE_URL) -> Optional[OpenAI]:
         return None
 
 # --- API Call ---
-def _call_gpt_with_retry(client, model, messages, max_tokens, temperature, tools=None, tool_choice=None):
+def call_gpt_chat_completion(client, model, messages, max_tokens, temperature, tools=None, tool_choice=None):
     """Makes the API call with retry logic, supporting tool calls."""
     last_exception = None
     for attempt in range(API_RETRY_ATTEMPTS):
@@ -513,7 +513,8 @@ def process_chapter_segment_for_details(segment_text, client, model_name, max_co
         logging.error(f"Error processing chapter segment: {e}", exc_info=True)
         return None
 
-def get_chapter_summary_and_tags(chapter_text: str, client: OpenAI) -> Tuple[Optional[str], Optional[List[str]]]:
+# Modified to accept model_name explicitly
+def get_chapter_summary_and_tags(chapter_text: str, client: OpenAI, model_name: str = MODEL_NAME_CHAT) -> Tuple[Optional[str], Optional[List[str]]]:
     """Generates summary and tags for the chapter text, handling segmentation."""
     total_tokens = count_tokens(chapter_text)
     logging.info(f"Total estimated tokens for chapter: {total_tokens}")
@@ -523,8 +524,9 @@ def get_chapter_summary_and_tags(chapter_text: str, client: OpenAI) -> Tuple[Opt
 
     if total_tokens <= processing_limit:
         logging.info("Processing chapter summary/tags in a single call.")
+        # Pass model_name explicitly
         result = process_chapter_segment_for_details(
-            chapter_text, client, MODEL_NAME_CHAT, MAX_COMPLETION_TOKENS_CHAPTER, TEMPERATURE, is_final_segment=True
+            chapter_text, client, model_name, MAX_COMPLETION_TOKENS_CHAPTER, TEMPERATURE, is_final_segment=True
         )
         if result:
             final_chapter_details = {'summary': result.get('summary'), 'tags': result.get('tags')}
@@ -546,8 +548,9 @@ def get_chapter_summary_and_tags(chapter_text: str, client: OpenAI) -> Tuple[Opt
         for i, segment_text in enumerate(tqdm(segments, desc="Processing Segments")):
             logging.debug(f"Processing segment {i + 1}/{len(segments)}...")
             is_final = (i == len(segments) - 1)
+            # Pass model_name explicitly
             segment_result = process_chapter_segment_for_details(
-                segment_text, client, MODEL_NAME_CHAT, MAX_COMPLETION_TOKENS_CHAPTER, TEMPERATURE,
+                segment_text, client, model_name, MAX_COMPLETION_TOKENS_CHAPTER, TEMPERATURE,
                 prev_summary=current_summary, prev_tags=current_tags, is_final_segment=is_final
             )
 
@@ -613,7 +616,8 @@ def process_chapter_file(md_file_path: str, client: OpenAI, last_processed_end_p
         # 6. Generate Summary and Tags via GPT
         chapter_summary, chapter_tags = None, None
         if client:
-            chapter_summary, chapter_tags = get_chapter_summary_and_tags(raw_content, client)
+            # Pass MODEL_NAME_CHAT explicitly
+            chapter_summary, chapter_tags = get_chapter_summary_and_tags(raw_content, client, model_name=MODEL_NAME_CHAT)
             if chapter_summary is None or chapter_tags is None:
                  logging.warning(f"  Failed to generate summary/tags for chapter {chapter_number}.")
                  # Decide whether to proceed without summary/tags or fail
