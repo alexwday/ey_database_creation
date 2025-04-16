@@ -483,6 +483,7 @@ def process_chapter_segment_for_details(segment_text, client, model_name, max_co
 
     try:
         response_content_json_str, usage_info = call_gpt_chat_completion(
+            client=client, # Added missing client argument
             messages=messages,
             model=model_name,
             max_tokens=max_completion_tokens,
