@@ -100,8 +100,9 @@ logging.basicConfig(
     ]
 )
 
-# Silence overly verbose HTTPX logging
+# Silence overly verbose HTTPX and OpenAI logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 
 # ==============================================================================
 # Utility Functions (Self-Contained, adapted from Stage 1 and original scripts)
