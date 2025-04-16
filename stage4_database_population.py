@@ -140,7 +140,7 @@ def insert_records(conn, table: str, records: List[Dict], batch_size: int = INSE
         "chapter_name", "chapter_tags", "chapter_summary", "chapter_token_count",
         "section_start_page", "section_end_page", "section_importance_score", "section_token_count",
         "section_hierarchy", "section_title", "section_standard", "section_standard_codes", "section_references",
-        "content", "embedding", "chunk_token_count"
+        "content", "embedding"
     ]
     cols_sql = ", ".join(columns)
     vals_sql = f"%s" # Template for execute_values

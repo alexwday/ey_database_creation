@@ -362,7 +362,8 @@ def merge_chunks_pass2(chunks: List[Dict], small_threshold: int, max_tokens: int
     while i < len(chunks):
         if merged_flags[i]: i += 1; continue
         current_chunk = chunks[i]
-        # Use 'chunk_token_count' which should exist after splitting/initial pass
+        # Use 'chunk_token_count' for internal merging logic only
+        # (this field will be removed from final output)
         current_chunk_tokens = current_chunk.get("chunk_token_count", 0)
 
         if current_chunk_tokens >= small_threshold:
@@ -622,13 +623,12 @@ def run_stage3():
             "section_standard_codes": chunk.get("section_standard_codes"),
             "section_references": chunk.get("section_references"),
             "content": chunk.get("content"),
-            "embedding": embedding_vector, # This will be None if generation failed
+            "embedding": embedding_vector # This will be None if generation failed
             # DB handles: id, created_at, text_search_vector
-            # Add chunk_token_count for the final chunk content
-            "chunk_token_count": chunk.get("chunk_token_count")
         }
         # Remove any intermediate fields if they accidentally carried over
-        record.pop("level", None)
+        record.pop("level", None) 
+        record.pop("chunk_token_count", None)  # Remove internal field not in final schema
         for i in range(1, 7): record.pop(f"level_{i}", None)
 
         final_records.append(record)

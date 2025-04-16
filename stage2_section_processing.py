@@ -615,13 +615,15 @@ def merge_small_sections(
             final_merged.append(current)
             i += 1
 
-    # Rename final token count field for consistency downstream
+    # Ensure token count field is consistently named 'section_token_count'
     for section in final_merged:
-        if "section_token_count" in section:
-            section["chunk_token_count"] = section.pop("section_token_count")
         # Remove word_count if it exists, as it's not used later
         section.pop("word_count", None)
-
+        
+        # Ensure we're using section_token_count as the field name (not chunk_token_count)
+        # This maintains consistency with our database schema
+        if "chunk_token_count" in section and "section_token_count" not in section:
+            section["section_token_count"] = section.pop("chunk_token_count")
 
     return final_merged
 
@@ -851,8 +853,8 @@ def process_chapter_for_sections(
 
     # Iterate through the *merged* sections now
     for section_data in tqdm(merged_sections, desc=f"Chapter {chapter_number} Sections"):
-        # section_data now contains 'content', 'section_token_count' (renamed to chunk_token_count by merge func),
-        # 'level', 'section_title', 'start_pos', 'end_pos', 'section_number', level_X fields, etc.
+        # section_data now contains 'content', 'section_token_count', 'level',
+        # 'section_title', 'start_pos', 'end_pos', 'section_number', level_X fields, etc.
 
         section_number = section_data["section_number"] # Use the number from the (potentially merged) section
         section_title = section_data.get('section_title', 'Unknown Title')
@@ -944,9 +946,11 @@ def process_chapter_for_sections(
         final_section_data["section_start_page"] = section_data.get("section_start_page", chapter_data.get("chapter_page_start"))
         final_section_data["section_end_page"] = section_data.get("section_end_page", chapter_data.get("chapter_page_end"))
 
-        # Ensure token count field name is consistent ('chunk_token_count' was set by merge func)
-        if "chunk_token_count" not in final_section_data:
-             final_section_data["chunk_token_count"] = count_tokens(final_section_data.get("cleaned_section_content", ""))
+        # Ensure token count field name is consistent ('section_token_count' is expected after merge func)
+        if "section_token_count" not in final_section_data:
+             # If somehow missing after merge (shouldn't happen), calculate it
+             logging.warning(f"Recalculating missing section_token_count for section {section_id}")
+             final_section_data["section_token_count"] = count_tokens(final_section_data.get("cleaned_section_content", ""))
 
 
         processed_chapter_sections.append(final_section_data) # Add the processed data
@@ -1108,8 +1112,6 @@ def run_stage2():
 
 if __name__ == "__main__":
     run_stage2()
-
-</file_content>
 
 Now that you have the latest state of the file, try the operation again with fewer, more precise SEARCH blocks. For large files especially, it may be prudent to try to limit yourself to <5 SEARCH/REPLACE blocks at a time, then wait for the user to respond with the result of the operation before following up with another replace_in_file call to make additional edits.
 (If you run into this error 3 times in a row, you may use the write_to_file tool as a fallback.)
