@@ -796,7 +796,10 @@ def _create_section_id(section_data: Dict) -> Optional[str]:
     """Creates a unique identifier string for a section."""
     doc_id = section_data.get("document_id")
     chap_num = section_data.get("chapter_number")
+    
+    # Always use the renumbered section_number for consistent IDs
     sec_num = section_data.get("section_number")
+    
     if doc_id is not None and chap_num is not None and sec_num is not None:
         return f"{doc_id}::{chap_num}::{sec_num}"
     logging.warning(f"Could not create section ID from data: {section_data.get('section_title', 'Unknown Section')}")
@@ -843,6 +846,12 @@ def process_chapter_for_sections(
         cleaned_sections, MIN_TOKENS, MAX_TOKENS, ULTRA_SMALL_THRESHOLD
     )
     logging.info(f"  Sections after merging small ones: {len(merged_sections)}")
+    
+    # 3a. Renumber section_number sequentially while preserving order
+    for i, section in enumerate(merged_sections):
+        section["original_section_number"] = section["section_number"]  # Preserve original for reference
+        section["section_number"] = i + 1  # Renumber sequentially starting from 1
+    logging.info(f"  Renumbered {len(merged_sections)} merged sections sequentially.")
 
 
     # 4. Process merged sections (enrichment, resumability check)
@@ -969,6 +978,7 @@ def process_chapter_for_sections(
 
     # Log chapter summary
     logging.info(f"  Chapter {chapter_number} Summary: Skipped={skipped_fully_processed_count}, Retried={retried_count}, New={newly_processed_count}, Failed={failed_processing_count}")
+    logging.info(f"  Total sections returned after renumbering and processing: {len(processed_chapter_sections)}")
     return processed_chapter_sections # Return all sections processed/retrieved for this chapter
 
 
