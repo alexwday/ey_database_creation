@@ -712,7 +712,7 @@ def run_stage1():
         logging.warning("OpenAI client initialization failed. Summary/Tag generation will be skipped for new chapters.")
 
     # --- Process Files ---
-    newly_processed_data = []
+    # 'existing_data' will now accumulate results during the run
     processed_this_run_count = 0
     skipped_count = 0
     failed_this_run_count = 0
@@ -738,45 +738,83 @@ def run_stage1():
 
         logging.info(f"Processing new or previously failed file: {file_basename}")
         chapter_result = process_chapter_file(str(md_file), client, last_processed_end_page)
+
         if chapter_result:
-            newly_processed_data.append(chapter_result)
-            # Update last_processed_end_page based on the *newly* processed chapter
-            # This assumes chapters are processed roughly in order for page inference
-            last_processed_end_page = chapter_result.get("chapter_page_end", last_processed_end_page)
+            # --- Success Case: Append, Update State, and Save Incrementally ---
+            existing_data.append(chapter_result)
+            processed_filenames.add(file_basename) # Add to set to prevent reprocessing if script restarts mid-run after failure
             processed_this_run_count += 1
+            # Update last_processed_end_page based on the *newly* processed chapter
+            last_processed_end_page = chapter_result.get("chapter_page_end", last_processed_end_page)
+
+            # --- Incremental Save ---
+            try:
+                # Re-sort before saving each time to maintain order in the file
+                temp_sorted_data = existing_data # Default if natsort fails or isn't available
+                if natsort:
+                    try:
+                        # Sort a copy to avoid modifying existing_data if sort fails mid-way
+                        temp_sorted_data = sorted(existing_data, key=lambda x: x.get('chapter_number', float('inf')))
+                    except Exception as sort_e:
+                        logging.warning(f"Could not re-sort data before incremental save: {sort_e}. Saving in current order.")
+                        temp_sorted_data = existing_data # Fallback to unsorted
+
+                with open(output_filepath, "w", encoding="utf-8") as f:
+                    json.dump(temp_sorted_data, f, indent=2, ensure_ascii=False)
+                logging.debug(f"Incrementally saved {len(temp_sorted_data)} records after processing {file_basename}")
+                # Update existing_data with the sorted version if sorting was successful
+                existing_data = temp_sorted_data
+
+            except Exception as e:
+                logging.error(f"Error during incremental save to {output_filepath} after processing {file_basename}: {e}", exc_info=True)
+                # Logged the error, but continue processing other files.
+                # The successfully processed data is still in 'existing_data' in memory.
+
         else:
+            # --- Failure Case ---
             failed_this_run_count += 1
+            logging.warning(f"Processing failed for {file_basename}. It will be retried on the next run.")
             # Don't update last_processed_end_page on failure
 
-    # --- Merge and Save Output ---
-    final_data = existing_data + newly_processed_data
-    # Optional: Re-sort final data by chapter number if needed
+    # --- Final Sort (Guarantee Order) ---
+    # Although we sort incrementally, do a final sort for guaranteed order in the final file state.
     if natsort:
         try:
-            final_data = sorted(final_data, key=lambda x: x.get('chapter_number', float('inf')))
-            logging.info("Re-sorted final combined data by chapter number.")
-        except Exception as e:
-            logging.warning(f"Could not re-sort final data: {e}")
+            existing_data = sorted(existing_data, key=lambda x: x.get('chapter_number', float('inf')))
+            logging.info("Performed final sort of chapter data.")
+            # Save the final sorted list one last time
+            with open(output_filepath, "w", encoding="utf-8") as f:
+                 json.dump(existing_data, f, indent=2, ensure_ascii=False)
+            logging.info(f"Saved final sorted data with {len(existing_data)} records.")
+        except Exception as final_sort_e:
+            logging.warning(f"Could not perform final sort or save: {final_sort_e}. File may not be perfectly sorted.")
+    else:
+        logging.info("natsort not available, skipping final sort. Data order depends on processing sequence.")
 
 
-    try:
-        with open(output_filepath, "w", encoding="utf-8") as f:
-            json.dump(final_data, f, indent=2, ensure_ascii=False)
-        logging.info(f"Successfully saved {len(final_data)} total chapter data entries to {output_filepath}")
-    except Exception as e:
-        logging.error(f"Error saving final combined output JSON to {output_filepath}: {e}", exc_info=True)
+    # --- Final Summary ---
+    # Data is already saved incrementally. Just log the final state.
+    final_record_count = 0
+    if output_filepath.exists():
+         try:
+             with open(output_filepath, "r", encoding="utf-8") as f:
+                 final_data_check = json.load(f)
+                 if isinstance(final_data_check, list):
+                     final_record_count = len(final_data_check)
+         except Exception:
+             logging.warning("Could not verify final record count from output file.")
 
-    # --- Print Summary ---
+
     logging.info("--- Stage 1 Summary ---")
     logging.info(f"Input files found    : {len(markdown_files)}")
     logging.info(f"Skipped (already done): {skipped_count}")
     logging.info(f"Processed this run   : {processed_this_run_count}")
     logging.info(f"Failed this run      : {failed_this_run_count}")
-    logging.info(f"Total records saved  : {len(final_data)}")
+    logging.info(f"Total records in file: {final_record_count} (approx. if verification failed)")
     logging.info(f"Output JSON file     : {output_filepath}")
     logging.info("--- Stage 1 Finished ---")
 
-    return final_data # Return combined data
+    return existing_data # Return the final in-memory list
 
 # ==============================================================================
 # Main Execution Block
