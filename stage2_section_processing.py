@@ -999,49 +999,68 @@ def run_stage2():
         logging.warning("OpenAI client initialization failed. Section enrichment will be skipped.")
 
     # --- Process Chapters for Sections ---
-    all_processed_sections_list = [] # Collect results from all chapters here
-    total_sections_processed_run = 0
-    total_sections_failed_run = 0
-    total_sections_skipped_run = 0
+    # existing_section_details dictionary holds the state, including loaded data
+    # We will update this dictionary and save it incrementally
 
     for chapter_data in tqdm(all_chapter_data, desc="Processing Chapters for Sections"):
+        chapter_number = chapter_data.get("chapter_number", "UNKNOWN")
         # Pass the dictionary of existing details for checking/retrying
+        # process_chapter_for_sections returns the list of sections for *this* chapter
         chapter_results = process_chapter_for_sections(
             chapter_data, client, existing_section_details
         )
-        all_processed_sections_list.extend(chapter_results)
 
-        # Optional: Update counts based on logs/return values if needed for final summary
-        # This requires process_chapter_for_sections to return counts or parse logs
+        # Update the main dictionary with the results from this chapter
+        # This overwrites existing entries for retried sections with the new data
+        # and adds newly processed sections. Skipped sections are already in the dict.
+        updated_count = 0
+        for section_data in chapter_results:
+            sec_id = _create_section_id(section_data)
+            if sec_id:
+                # Check if this section was actually processed/retried in this run
+                # or just retrieved from existing_section_details
+                # We only need to update the dictionary if it's new/retried data
+                # Note: process_chapter_for_sections returns *all* sections for the chapter,
+                # including those skipped because they were already valid. We need to update
+                # the dictionary only with sections that were actually processed or retried.
+                # A simpler approach: always update the dictionary with the returned data.
+                # If it was skipped, it's the same data; if processed/retried, it's the new data.
+                existing_section_details[sec_id] = section_data
+                updated_count += 1
+            else:
+                 logging.warning(f"Could not generate ID for a section in chapter {chapter_number} results, cannot update map.")
 
-    # --- Final Sort and Save ---
-    logging.info("Performing final sort and save...")
-    final_data_to_save = all_processed_sections_list # Already a list
-    if natsort:
+        logging.debug(f"Updated in-memory map with {updated_count} sections from chapter {chapter_number}.")
+
+        # --- Incremental Save (after each chapter) ---
         try:
-            # Sort by chapter then section number
-            final_data_to_save = sorted(all_processed_sections_list, key=lambda x: (
-                x.get('chapter_number', float('inf')),
-                x.get('section_number', float('inf'))
-            ))
-            logging.info("Performed final sort of section data.")
-        except Exception as final_sort_e:
-            logging.warning(f"Could not perform final sort: {final_sort_e}. Saving potentially unsorted data.")
-            # Keep final_data_to_save as the unsorted list
-    else:
-        logging.info("natsort not available, skipping final sort.")
+            # Convert current state of the dictionary values to a list
+            current_data_list = list(existing_section_details.values())
+            # Sort the list before saving
+            temp_sorted_data = current_data_list
+            if natsort:
+                try:
+                    # Sort by chapter then section number
+                    temp_sorted_data = sorted(current_data_list, key=lambda x: (
+                        x.get('chapter_number', float('inf')),
+                        x.get('section_number', float('inf'))
+                    ))
+                except Exception as sort_e:
+                    logging.warning(f"Could not sort data before incremental save for chapter {chapter_number}: {sort_e}. Saving in current order.")
+                    # Keep temp_sorted_data as the unsorted list
 
-    try:
-        with open(output_filepath, "w", encoding="utf-8") as f:
-            json.dump(final_data_to_save, f, indent=2, ensure_ascii=False)
-        logging.info(f"Saved final data with {len(final_data_to_save)} section records to {output_filepath}")
-    except Exception as e:
-        logging.error(f"Error saving final output JSON to {output_filepath}: {e}", exc_info=True)
+            # Write the sorted list to the output file, overwriting previous content
+            with open(output_filepath, "w", encoding="utf-8") as f:
+                json.dump(temp_sorted_data, f, indent=2, ensure_ascii=False)
+            logging.info(f"Incrementally saved {len(temp_sorted_data)} total section records after processing Chapter {chapter_number}")
 
+        except Exception as e:
+            logging.error(f"Error during incremental save to {output_filepath} after processing Chapter {chapter_number}: {e}", exc_info=True)
+            # Continue processing other chapters, but progress might be lost if script fails later
 
-    # --- Print Summary ---
-    final_record_count = len(final_data_to_save)
-    # TODO: Enhance summary by tracking processed/failed/skipped counts more accurately if needed
+    # --- Final Summary ---
+    # No final save needed here as it's done incrementally
+    final_record_count = len(existing_section_details) # Count items in the final dictionary
     logging.info("--- Stage 2 Summary ---")
     logging.info(f"Total chapters from Stage 1: {len(all_chapter_data)}")
     logging.info(f"Total sections in final file : {final_record_count}")
