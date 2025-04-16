@@ -312,6 +312,13 @@ def split_chapter_into_sections(chapter_data: dict) -> list[dict]:
     current_heading_context = {f"level_{i}": None for i in range(1, 7)}
     # Initialize L1 with chapter name for context
     current_heading_context["level_1"] = chapter_data.get("chapter_name")
+    # Get chapter-level fields once for potential use
+    document_id = chapter_data.get("document_id")
+    chapter_number = chapter_data.get("chapter_number")
+    chapter_name = chapter_data.get("chapter_name")
+    chapter_token_count = chapter_data.get("chapter_token_count")
+    chapter_page_start = chapter_data.get("chapter_page_start")
+    chapter_page_end = chapter_data.get("chapter_page_end")
 
     # Handle content before the first heading
     first_heading_pos = headings[0]['position'] if headings and headings[0]['level'] > 0 else len(raw_content)
@@ -319,15 +326,25 @@ def split_chapter_into_sections(chapter_data: dict) -> list[dict]:
         intro_slice = raw_content[:first_heading_pos].strip()
         if intro_slice:
             section_index_in_chapter += 1
-            initial_sections.append({
+            # Ensure intro section includes chapter pass-through fields
+            intro_section_data = {
+                # Pass-through fields
+                "document_id": document_id,
+                "chapter_number": chapter_number,
+                "chapter_name": chapter_name,
+                "chapter_token_count": chapter_token_count,
+                "chapter_page_start": chapter_page_start,
+                "chapter_page_end": chapter_page_end,
+                # Section specific fields
                 "raw_section_slice": intro_slice,
                 "level": 1, # Assign level 1 conceptually
-                "section_title": chapter_data.get("chapter_name", "Introduction"), # Use chapter name
+                "section_title": chapter_name or "Introduction", # Use chapter name as title
                 "start_pos": 0,
                 "end_pos": first_heading_pos,
                 "section_number": section_index_in_chapter,
-                "level_1": chapter_data.get("chapter_name"),
-            })
+                "level_1": chapter_name, # Add level_1 context
+            }
+            initial_sections.append(intro_section_data)
 
     # Process sections defined by headings
     for i in range(len(headings) - 1):
@@ -351,7 +368,16 @@ def split_chapter_into_sections(chapter_data: dict) -> list[dict]:
             for lower_level in range(current_level + 1, 7):
                 current_heading_context[f"level_{lower_level}"] = None
 
+            # Create section data dictionary, including pass-through fields
             section_data = {
+                # Pass-through fields
+                "document_id": document_id,
+                "chapter_number": chapter_number,
+                "chapter_name": chapter_name,
+                "chapter_token_count": chapter_token_count,
+                "chapter_page_start": chapter_page_start,
+                "chapter_page_end": chapter_page_end,
+                # Section specific fields
                 "raw_section_slice": raw_section_slice,
                 "level": current_level,
                 "section_title": current_title,
@@ -431,8 +457,9 @@ def merge_small_sections(
         if i + 1 < len(sections_to_process):
             next_s = sections_to_process[i + 1]
             next_tokens = next_s.get("section_token_count", 0)
+            # Ensure chapter_number exists before comparing
             if (
-                current["chapter_number"] == next_s["chapter_number"]
+                current.get("chapter_number") == next_s.get("chapter_number")
                 and current.get("level") == next_s.get("level") # Require same level for forward merge
                 and current_tokens + next_tokens <= max_tokens
             ):
@@ -455,8 +482,9 @@ def merge_small_sections(
             prev_s = pass1_merged[-1]
             prev_tokens = prev_s.get("section_token_count", 0)
             # Check chapter, token limits, and compatible levels (current is same or deeper level)
+            # Ensure chapter_number exists before comparing
             if (
-                current["chapter_number"] == prev_s["chapter_number"]
+                current.get("chapter_number") == prev_s.get("chapter_number")
                 and prev_tokens + current_tokens <= max_tokens
                 and current.get("level", 1) >= prev_s.get("level", 1) # Allow merging deeper level back
             ):
@@ -505,8 +533,9 @@ def merge_small_sections(
             if i + 1 < len(pass1_merged):
                 next_s = pass1_merged[i + 1]
                 next_tokens = next_s.get("section_token_count", 0)
+                # Ensure chapter_number exists before comparing
                 if (
-                    current["chapter_number"] == next_s["chapter_number"]
+                    current.get("chapter_number") == next_s.get("chapter_number")
                     and current_tokens + next_tokens <= max_tokens
                 ):
                     # Create merged section, taking metadata from NEXT section but content from both
@@ -525,8 +554,9 @@ def merge_small_sections(
             if final_merged:
                 prev_s = final_merged[-1]
                 prev_tokens = prev_s.get("section_token_count", 0)
+                # Ensure chapter_number exists before comparing
                 if (
-                    current["chapter_number"] == prev_s["chapter_number"]
+                    current.get("chapter_number") == prev_s.get("chapter_number")
                     and prev_tokens + current_tokens <= max_tokens
                 ):
                     # Merge current's content into previous
@@ -545,8 +575,9 @@ def merge_small_sections(
                 if final_merged:
                     prev_s = final_merged[-1]
                     prev_tokens = prev_s.get("section_token_count", 0)
+                    # Ensure chapter_number exists before comparing
                     if (
-                        current["chapter_number"] == prev_s["chapter_number"]
+                        current.get("chapter_number") == prev_s.get("chapter_number")
                         and prev_tokens + current_tokens <= max_tokens
                     ):
                         # Merge current's content into previous
@@ -562,8 +593,9 @@ def merge_small_sections(
                 if i + 1 < len(pass1_merged):
                     next_s = pass1_merged[i + 1]
                     next_tokens = next_s.get("section_token_count", 0)
+                    # Ensure chapter_number exists before comparing
                     if (
-                        current["chapter_number"] == next_s["chapter_number"]
+                        current.get("chapter_number") == next_s.get("chapter_number")
                         and current_tokens + next_tokens <= max_tokens
                     ):
                         # Create merged section, taking metadata from NEXT section
@@ -1068,7 +1100,7 @@ def run_stage2():
     logging.info(f"Output JSON file             : {output_filepath}")
     logging.info("--- Stage 2 Finished ---")
 
-    return final_data_to_save # Return the final data list
+    return list(existing_section_details.values()) # Return the final data list
 
 # ==============================================================================
 # Main Execution Block
@@ -1076,3 +1108,42 @@ def run_stage2():
 
 if __name__ == "__main__":
     run_stage2()
+
+</file_content>
+
+Now that you have the latest state of the file, try the operation again with fewer, more precise SEARCH blocks. For large files especially, it may be prudent to try to limit yourself to <5 SEARCH/REPLACE blocks at a time, then wait for the user to respond with the result of the operation before following up with another replace_in_file call to make additional edits.
+(If you run into this error 3 times in a row, you may use the write_to_file tool as a fallback.)
+</error><environment_details>
+# VSCode Visible Files
+stage2_section_processing.py
+
+# VSCode Open Tabs
+1_chunk_creation/1_extract_chapters_to_json.py
+1_chunk_creation/2_identify_sections_and_merge.py
+1_chunk_creation/4_split_large_sections.py
+1_chunk_creation/5_merge_small_chunks.py
+2_gpt_enhancement/7_generate_chapter_details.py
+2_gpt_enhancement/8_generate_section_details.py
+2_gpt_enhancement/9_assemble_database_records.py
+stage3_chunking_assembly.py
+stage4_database_population.py
+stage1_chapter_processing.py
+temp_count_stage2_sections.py
+stage2_section_processing.py
+9_assemble_database_records.py
+10_generate_embeddings.py
+2_gpt_enhancement/10_generate_embeddings.py
+2_gpt_enhancement/11_populate_textbook_chunks.py
+2_gpt_enhancement/12_verify_database_insertion.py
+2_gpt_enhancement/13_hybrid_search.py
+2_gpt_enhancement/14_hybrid_search_assessment.py
+
+# Current Time
+4/16/2025, 8:22:55 AM (America/Halifax, UTC-3:00)
+
+# Context Window Usage
+274,345 / 1,048.576K tokens used (26%)
+
+# Current Mode
+ACT MODE
+</environment_details>
