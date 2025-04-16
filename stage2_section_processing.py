@@ -84,6 +84,13 @@ MAX_RECENT_SUMMARIES_CONTEXT = 5 # Number of previous section summaries to inclu
 PROMPT_TOKEN_COST = 0.01
 COMPLETION_TOKEN_COST = 0.03
 
+# --- Section Merging Thresholds (from script 2) ---
+# OPTIMAL_TOKENS = 500 # Target token count (currently informational).
+MAX_TOKENS = 750  # Maximum tokens allowed in a merged section.
+MIN_TOKENS = 250  # Sections below this count trigger merging logic (Pass 1).
+ULTRA_SMALL_THRESHOLD = 25  # Sections below this trigger more aggressive merging (Pass 2).
+
+
 # --- Logging Setup ---
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 # Use a different log file for this stage
@@ -373,6 +380,220 @@ def generate_hierarchy_string(section_data: dict) -> str:
         else: break # Stop if a level is missing
     return " > ".join(parts)
 
+# --- Section Merging Logic (Copied from 1_chunk_creation/2_identify_sections_and_merge.py) ---
+
+def merge_small_sections(
+    sections: list[dict], min_tokens: int, max_tokens: int, ultra_small_threshold: int
+) -> list[dict]:
+    """
+    Merges sections smaller than `min_tokens` or `ultra_small_threshold`
+    with adjacent sections, respecting hierarchy and `max_tokens` limit.
+
+    Operates in two passes:
+    1. Merges sections < `min_tokens` based on level and proximity.
+    2. Merges sections < `ultra_small_threshold` more aggressively.
+
+    Args:
+        sections: List of cleaned section dictionaries (must include 'content',
+                  'section_token_count', 'start_pos', 'end_pos', 'level', 'chapter_number',
+                  and other pass-through fields).
+        min_tokens: Threshold for the first merging pass.
+        max_tokens: Maximum allowed tokens for a merged section.
+        ultra_small_threshold: Threshold for the second, more aggressive pass.
+
+    Returns:
+        A list of sections after merging potentially small ones.
+    """
+    if not sections:
+        return []
+
+    # Ensure sections are sorted by their original position (section_number) before merging
+    sections_to_process = sorted(sections, key=lambda s: s["section_number"])
+
+    # --- Pass 1: Merge sections smaller than `min_tokens` ---
+    pass1_merged = []
+    i = 0
+    while i < len(sections_to_process):
+        current = sections_to_process[i]
+        # Use section_token_count for merging decisions
+        current_tokens = current.get("section_token_count", 0)
+
+        # Keep sections that are already large enough
+        if current_tokens >= min_tokens:
+            pass1_merged.append(current)
+            i += 1
+            continue
+
+        # Attempt to merge small sections
+        merged_pass1 = False
+
+        # Strategy 1: Merge forward with next section if compatible levels and combined size <= max_tokens
+        if i + 1 < len(sections_to_process):
+            next_s = sections_to_process[i + 1]
+            next_tokens = next_s.get("section_token_count", 0)
+            if (
+                current["chapter_number"] == next_s["chapter_number"]
+                and current.get("level") == next_s.get("level") # Require same level for forward merge
+                and current_tokens + next_tokens <= max_tokens
+            ):
+                # Create merged section data, keeping metadata from the *first* section (current)
+                merged_data = current.copy() # Start with current's metadata
+                merged_data["content"] = f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
+                # Recalculate token count for the merged content
+                merged_data["section_token_count"] = count_tokens(merged_data["content"])
+                # Keep word count for reference, though less critical now (removed word_count field later)
+                # merged_data["word_count"] = current.get("word_count", 0) + next_s.get("word_count", 0)
+                merged_data["end_pos"] = next_s["end_pos"]
+                # All other fields (hierarchy, pass-through) are inherited from 'current'
+
+                pass1_merged.append(merged_data)
+                i += 2  # Skip the next section as it's now merged
+                merged_pass1 = True
+
+        # Strategy 2: Merge backward with the previously added section if compatible
+        if not merged_pass1 and pass1_merged:
+            prev_s = pass1_merged[-1]
+            prev_tokens = prev_s.get("section_token_count", 0)
+            # Check chapter, token limits, and compatible levels (current is same or deeper level)
+            if (
+                current["chapter_number"] == prev_s["chapter_number"]
+                and prev_tokens + current_tokens <= max_tokens
+                and current.get("level", 1) >= prev_s.get("level", 1) # Allow merging deeper level back
+            ):
+                # Merge current's content into the previous section
+                prev_s["content"] = f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
+                # Recalculate token count for the merged content
+                prev_s["section_token_count"] = count_tokens(prev_s["content"])
+                # prev_s["word_count"] = prev_s.get("word_count", 0) + current.get("word_count", 0)
+                prev_s["end_pos"] = current["end_pos"]
+                # Metadata (hierarchy, pass-through) remains from prev_s
+
+                i += 1 # Move to the next section to process
+                merged_pass1 = True
+
+        # If no merge occurred, keep the current section as is
+        if not merged_pass1:
+            pass1_merged.append(current)
+            i += 1
+
+    # --- Pass 2: Merge "ultra-small" sections (< ultra_small_threshold) ---
+    if not pass1_merged:  # Skip if Pass 1 resulted in nothing
+        return []
+
+    final_merged = []
+    i = 0
+    while i < len(pass1_merged):
+        current = pass1_merged[i]
+        # Use section_token_count for decisions here too
+        current_tokens = current.get("section_token_count", 0)
+
+        # Keep sections that meet the ultra-small threshold
+        if current_tokens >= ultra_small_threshold:
+            final_merged.append(current)
+            i += 1
+            continue
+
+        # Determine if the section content looks like just a heading
+        is_heading_only = (
+            re.match(r"^\s*#+\s+[^#]", current.get("content", "").strip()) is not None
+        )
+        merged_pass2 = False
+
+        # --- Preferred Merge Direction ---
+        if is_heading_only:
+            # Headings prefer merging FORWARD (merge *current* heading into the *next* section's content)
+            if i + 1 < len(pass1_merged):
+                next_s = pass1_merged[i + 1]
+                next_tokens = next_s.get("section_token_count", 0)
+                if (
+                    current["chapter_number"] == next_s["chapter_number"]
+                    and current_tokens + next_tokens <= max_tokens
+                ):
+                    # Create merged section, taking metadata from NEXT section but content from both
+                    merged_data = next_s.copy() # Start with next section's metadata
+                    merged_data["content"] = f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
+                    merged_data["section_token_count"] = count_tokens(merged_data["content"])
+                    # merged_data["word_count"] = current.get("word_count", 0) + next_s.get("word_count", 0)
+                    merged_data["start_pos"] = current["start_pos"] # Start pos from current
+                    # Hierarchy etc. comes from next_s
+
+                    final_merged.append(merged_data)
+                    i += 2 # Skip current and next
+                    merged_pass2 = True
+        else:
+            # Content sections prefer merging BACKWARD (merge *current* content into the *previous* section)
+            if final_merged:
+                prev_s = final_merged[-1]
+                prev_tokens = prev_s.get("section_token_count", 0)
+                if (
+                    current["chapter_number"] == prev_s["chapter_number"]
+                    and prev_tokens + current_tokens <= max_tokens
+                ):
+                    # Merge current's content into previous
+                    prev_s["content"] = f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
+                    prev_s["section_token_count"] = count_tokens(prev_s["content"])
+                    # prev_s["word_count"] = prev_s.get("word_count", 0) + current.get("word_count", 0)
+                    prev_s["end_pos"] = current["end_pos"]
+                    # Metadata remains from prev_s
+                    i += 1 # Move to next item in pass1_merged
+                    merged_pass2 = True
+
+        # --- Fallback Merge Direction (if preferred failed) ---
+        if not merged_pass2:
+            if is_heading_only:
+                # Fallback for heading: Merge BACKWARD (merge *current* heading into *previous*)
+                if final_merged:
+                    prev_s = final_merged[-1]
+                    prev_tokens = prev_s.get("section_token_count", 0)
+                    if (
+                        current["chapter_number"] == prev_s["chapter_number"]
+                        and prev_tokens + current_tokens <= max_tokens
+                    ):
+                        # Merge current's content into previous
+                        prev_s["content"] = f"{prev_s.get('content', '')}\n\n{current.get('content', '')}"
+                        prev_s["section_token_count"] = count_tokens(prev_s["content"])
+                        # prev_s["word_count"] = prev_s.get("word_count", 0) + current.get("word_count", 0)
+                        prev_s["end_pos"] = current["end_pos"]
+                        # Metadata remains from prev_s
+                        i += 1 # Move to next item in pass1_merged
+                        merged_pass2 = True
+            else:
+                # Fallback for content: Merge FORWARD (merge *current* content into *next*)
+                if i + 1 < len(pass1_merged):
+                    next_s = pass1_merged[i + 1]
+                    next_tokens = next_s.get("section_token_count", 0)
+                    if (
+                        current["chapter_number"] == next_s["chapter_number"]
+                        and current_tokens + next_tokens <= max_tokens
+                    ):
+                        # Create merged section, taking metadata from NEXT section
+                        merged_data = next_s.copy() # Start with next section's metadata
+                        merged_data["content"] = f"{current.get('content', '')}\n\n{next_s.get('content', '')}"
+                        merged_data["section_token_count"] = count_tokens(merged_data["content"])
+                        # merged_data["word_count"] = current.get("word_count", 0) + next_s.get("word_count", 0)
+                        merged_data["start_pos"] = current["start_pos"] # Start pos from current
+                        # Hierarchy etc. comes from next_s
+
+                        final_merged.append(merged_data)
+                        i += 2 # Skip current and next
+                        merged_pass2 = True
+
+        # If no merge happened in Pass 2 either, keep the ultra-small section
+        if not merged_pass2:
+            final_merged.append(current)
+            i += 1
+
+    # Rename final token count field for consistency downstream
+    for section in final_merged:
+        if "section_token_count" in section:
+            section["chunk_token_count"] = section.pop("section_token_count")
+        # Remove word_count if it exists, as it's not used later
+        section.pop("word_count", None)
+
+
+    return final_merged
+
+
 # --- GPT Prompting for Section Details ---
 SECTION_TOOL_SCHEMA = {
     "type": "function",
@@ -563,18 +784,48 @@ def process_chapter_for_sections(
     processed_chapter_sections = [] # Store all sections for this chapter
     recent_section_summaries = [] # Context for GPT within this chapter run
 
+    # 1. Initial split based on headings
     initial_sections = split_chapter_into_sections(chapter_data)
-    logging.info(f"  Identified {len(initial_sections)} initial sections for Chapter {chapter_number}.")
+    logging.info(f"  Identified {len(initial_sections)} initial sections.")
+
+    # 2. Clean content and calculate initial metrics
+    cleaned_sections = []
+    for section_raw in initial_sections:
+        # Clean Azure tags from the raw slice
+        cleaned_content = clean_azure_tags(section_raw["raw_section_slice"])
+        # Only keep sections with non-whitespace content after cleaning
+        if cleaned_content.strip():
+            section_clean = section_raw.copy() # Keep all fields from initial split
+            section_clean["content"] = cleaned_content # Store cleaned content
+            # Calculate and store the *initial* token count needed for merging
+            section_clean["section_token_count"] = count_tokens(cleaned_content)
+            # Remove raw slice now that we have cleaned content
+            section_clean.pop("raw_section_slice", None)
+            cleaned_sections.append(section_clean)
+    logging.info(f"  Sections after cleaning & filtering empty: {len(cleaned_sections)}")
+
+    # 3. Merge small sections
+    merged_sections = merge_small_sections(
+        cleaned_sections, MIN_TOKENS, MAX_TOKENS, ULTRA_SMALL_THRESHOLD
+    )
+    logging.info(f"  Sections after merging small ones: {len(merged_sections)}")
+
+
+    # 4. Process merged sections (enrichment, resumability check)
     skipped_fully_processed_count = 0
     retried_count = 0
     newly_processed_count = 0
     failed_processing_count = 0
 
-    for section_raw_data in tqdm(initial_sections, desc=f"Chapter {chapter_number} Sections"):
-        section_number = section_raw_data["section_number"]
-        section_title = section_raw_data.get('section_title', 'Unknown Title')
+    # Iterate through the *merged* sections now
+    for section_data in tqdm(merged_sections, desc=f"Chapter {chapter_number} Sections"):
+        # section_data now contains 'content', 'section_token_count' (renamed to chunk_token_count by merge func),
+        # 'level', 'section_title', 'start_pos', 'end_pos', 'section_number', level_X fields, etc.
 
-        # Create ID for checking/storing
+        section_number = section_data["section_number"] # Use the number from the (potentially merged) section
+        section_title = section_data.get('section_title', 'Unknown Title')
+
+        # Create ID for checking/storing using potentially merged section data
         temp_id_data = {"document_id": document_id, "chapter_number": chapter_number, "section_number": section_number}
         section_id = _create_section_id(temp_id_data)
         if not section_id:
@@ -584,84 +835,88 @@ def process_chapter_for_sections(
 
         # --- Check existing data ---
         existing_record = existing_section_details.get(section_id)
-        needs_processing = True
+        needs_enrichment = True
         if existing_record:
             # Check if enrichment exists (using section_summary as a proxy)
             if existing_record.get("section_summary") is not None:
-                logging.debug(f"  Section {section_id} already processed with enrichment. Skipping.")
-                processed_chapter_sections.append(existing_record) # Add existing valid record
+                logging.debug(f"  Section {section_id} already processed with enrichment. Using existing.")
+                # Use the existing enriched record directly
+                final_section_data = existing_record
+                processed_chapter_sections.append(final_section_data)
                 # Update context window even if skipped
-                if existing_record.get("section_summary"):
-                    recent_section_summaries.append(existing_record["section_summary"])
+                if final_section_data.get("section_summary"):
+                    recent_section_summaries.append(final_section_data["section_summary"])
                 skipped_fully_processed_count += 1
-                needs_processing = False
+                needs_enrichment = False
             else:
-                # Changed to DEBUG to reduce console noise
-                logging.debug(f"  Section {section_id} found with missing enrichment. Retrying processing.")
+                # Found existing record but it lacks enrichment, needs processing
+                logging.debug(f"  Section {section_id} found with missing enrichment. Retrying enrichment.")
                 retried_count += 1
         else:
+             # Section not found in existing data, needs processing
              logging.debug(f"  Section {section_id} not found in existing data. Processing as new.")
              newly_processed_count += 1
 
-        if not needs_processing:
-            continue # Go to next section in initial_sections
+        if not needs_enrichment:
+            continue # Go to next section in merged_sections
 
-        # --- Process Section (New or Retry) ---
-        logging.debug(f"  Processing Section {section_id} ('{section_title[:30]}...')")
-        raw_slice = section_raw_data["raw_section_slice"]
-        cleaned_content = clean_azure_tags(raw_slice)
-        section_token_count = count_tokens(cleaned_content)
+        # --- Enrich Section (New or Retry) ---
+        logging.debug(f"  Enriching Section {section_id} ('{section_title[:30]}...')")
 
-        if not cleaned_content.strip():
-            logging.debug(f"  Skipping empty section {section_number} after cleaning.")
-            continue
-
-        # Determine section page range
-        section_start_page, section_end_page = get_section_page_range(
-            raw_slice, chapter_data.get("chapter_page_start", 0)
-        )
-
-        # Generate hierarchy string
-        section_hierarchy = generate_hierarchy_string(section_raw_data)
-
-        # Get GPT enrichment
-        gpt_details = None
-        if client:
-            # Use only the last N summaries for context to limit prompt size
+        # Content for enrichment comes from the potentially merged section_data
+        content_for_gpt = section_data.get("content", "")
+        if not content_for_gpt:
+             logging.warning(f"  Skipping enrichment for section {section_id} due to empty content after merge.")
+             # Still need to assemble basic data for this section
+             gpt_details = None
+        elif client:
+            # Use only the last N summaries for context
             context_summaries = recent_section_summaries[-MAX_RECENT_SUMMARIES_CONTEXT:]
-            gpt_details = get_section_details_from_gpt(cleaned_content, chapter_data, context_summaries, client)
+            # Pass potentially merged content to GPT
+            gpt_details = get_section_details_from_gpt(content_for_gpt, chapter_data, context_summaries, client)
         else:
             logging.debug("  Skipping GPT enrichment (no client).")
+            gpt_details = None
 
-        # Assemble final section data
-        final_section_data = {
-            # Carry over from chapter
-            "document_id": chapter_data.get("document_id"),
-            "chapter_number": chapter_number,
-            "chapter_name": chapter_data.get("chapter_name"),
-            "chapter_tags": chapter_data.get("chapter_tags"),
-            "chapter_summary": chapter_data.get("chapter_summary"),
-            "chapter_token_count": chapter_data.get("chapter_token_count"),
-            # Section specific
-            "section_number": section_number,
-            "section_title": section_raw_data.get("section_title"),
-            "section_hierarchy": section_hierarchy,
-            "section_token_count": section_token_count,
-            "section_start_page": section_start_page,
-            "section_end_page": section_end_page,
-            "cleaned_section_content": cleaned_content, # Pass cleaned content
-            "raw_section_slice_start_pos": section_raw_data.get("start_pos"), # Pass raw positions
-            "raw_section_slice_end_pos": section_raw_data.get("end_pos"),
-            # From GPT (or defaults)
-            "section_summary": gpt_details.get("section_summary", None) if gpt_details else None,
-            "section_tags": gpt_details.get("section_tags", []) if gpt_details else [],
-            "section_standard": gpt_details.get("section_standard", "N/A") if gpt_details else "N/A",
-            "section_standard_codes": gpt_details.get("section_standard_codes", []) if gpt_details else [],
-            "section_importance_score": gpt_details.get("section_importance_score", 0.5) if gpt_details else 0.5,
-            "section_references": gpt_details.get("section_references", []) if gpt_details else [],
-            # Add level_x hierarchy fields from raw data
-            **{f"level_{i}": section_raw_data.get(f"level_{i}") for i in range(1, 7) if section_raw_data.get(f"level_{i}")}
-        }
+        # Assemble final section data using the merged section_data as base
+        # and adding GPT details if available
+        final_section_data = section_data.copy() # Start with merged section data
+
+        # Add/update fields based on GPT enrichment or defaults
+        final_section_data["section_summary"] = gpt_details.get("section_summary", None) if gpt_details else None
+        final_section_data["section_tags"] = gpt_details.get("section_tags", []) if gpt_details else []
+        final_section_data["section_standard"] = gpt_details.get("section_standard", "N/A") if gpt_details else "N/A"
+        final_section_data["section_standard_codes"] = gpt_details.get("section_standard_codes", []) if gpt_details else []
+        final_section_data["section_importance_score"] = gpt_details.get("section_importance_score", 0.5) if gpt_details else 0.5
+        final_section_data["section_references"] = gpt_details.get("section_references", []) if gpt_details else []
+
+        # Ensure required fields from merge/split are present
+        final_section_data["document_id"] = chapter_data.get("document_id")
+        final_section_data["chapter_number"] = chapter_number
+        final_section_data["chapter_name"] = chapter_data.get("chapter_name")
+        final_section_data["chapter_tags"] = chapter_data.get("chapter_tags") # From stage 1
+        final_section_data["chapter_summary"] = chapter_data.get("chapter_summary") # From stage 1
+        final_section_data["chapter_token_count"] = chapter_data.get("chapter_token_count") # From stage 1
+
+        # Rename 'content' to 'cleaned_section_content' for final output consistency
+        if "content" in final_section_data:
+            final_section_data["cleaned_section_content"] = final_section_data.pop("content")
+
+        # Ensure hierarchy string is present (it should be from merge_small_sections inheriting it)
+        if "section_hierarchy" not in final_section_data:
+             final_section_data["section_hierarchy"] = generate_hierarchy_string(final_section_data)
+
+        # Add page numbers (needs logic if merge affects this - assume start/end from original section for now)
+        # TODO: Revisit page number logic if merging significantly changes span.
+        # For now, use chapter pages as fallback if section pages are missing after merge.
+        final_section_data["section_start_page"] = section_data.get("section_start_page", chapter_data.get("chapter_page_start"))
+        final_section_data["section_end_page"] = section_data.get("section_end_page", chapter_data.get("chapter_page_end"))
+
+        # Ensure token count field name is consistent ('chunk_token_count' was set by merge func)
+        if "chunk_token_count" not in final_section_data:
+             final_section_data["chunk_token_count"] = count_tokens(final_section_data.get("cleaned_section_content", ""))
+
+
         processed_chapter_sections.append(final_section_data) # Add the processed data
 
         # Update recent summaries list for context (use summary from final_section_data)
