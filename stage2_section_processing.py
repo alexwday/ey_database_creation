@@ -852,6 +852,80 @@ def process_chapter_for_sections(
         section["original_section_number"] = section["section_number"]  # Preserve original for reference
         section["section_number"] = i + 1  # Renumber sequentially starting from 1
     logging.info(f"  Renumbered {len(merged_sections)} merged sections sequentially.")
+    
+    # 3b. Extract and assign page numbers from Azure tags
+    chapter_start_page = chapter_data.get("chapter_page_start")
+    chapter_end_page = chapter_data.get("chapter_page_end")
+    
+    # Ensure first and last sections have the chapter's start/end pages
+    if merged_sections and chapter_start_page is not None:
+        merged_sections[0]["section_start_page"] = chapter_start_page
+    if merged_sections and chapter_end_page is not None:
+        merged_sections[-1]["section_end_page"] = chapter_end_page
+        
+    # Find page tags in each section's content
+    page_numbers_by_section = []
+    for section in merged_sections:
+        content = section.get("content", "")
+        page_tags = list(PAGE_NUMBER_TAG_PATTERN.finditer(content))
+        
+        if page_tags:
+            # Extract page numbers from content
+            page_numbers = [int(match.group(1)) for match in page_tags]
+            page_numbers_by_section.append((section["section_number"], min(page_numbers), max(page_numbers)))
+            
+            # Set section's page range based on its own tags
+            section["section_start_page"] = min(page_numbers)
+            section["section_end_page"] = max(page_numbers)
+            logging.debug(f"  Section {section['section_number']} has page tags: range {min(page_numbers)}-{max(page_numbers)}")
+        else:
+            page_numbers_by_section.append((section["section_number"], None, None))
+            logging.debug(f"  Section {section['section_number']} has no page tags")
+    
+    # Fill in missing page numbers by inferring from neighboring sections
+    for i, section in enumerate(merged_sections):
+        if "section_start_page" not in section or section["section_start_page"] is None:
+            # Find previous section with a defined end page
+            prev_end_page = None
+            for j in range(i-1, -1, -1):
+                if merged_sections[j].get("section_end_page") is not None:
+                    prev_end_page = merged_sections[j]["section_end_page"]
+                    break
+            
+            # If found, use previous section's end page for current start page
+            if prev_end_page is not None:
+                section["section_start_page"] = prev_end_page
+                logging.debug(f"  Inferred section {section['section_number']} start page = {prev_end_page} (from previous section)")
+            else:
+                # If not found, use chapter start page
+                section["section_start_page"] = chapter_start_page
+                logging.debug(f"  Section {section['section_number']} start page defaulting to chapter start: {chapter_start_page}")
+        
+        if "section_end_page" not in section or section["section_end_page"] is None:
+            # Find next section with a defined start page
+            next_start_page = None
+            for j in range(i+1, len(merged_sections)):
+                if merged_sections[j].get("section_start_page") is not None:
+                    next_start_page = merged_sections[j]["section_start_page"]
+                    break
+            
+            # If found, use next section's start page for current end page
+            if next_start_page is not None:
+                section["section_end_page"] = next_start_page
+                logging.debug(f"  Inferred section {section['section_number']} end page = {next_start_page} (from next section)")
+            else:
+                # If not found, use chapter end page
+                section["section_end_page"] = chapter_end_page
+                logging.debug(f"  Section {section['section_number']} end page defaulting to chapter end: {chapter_end_page}")
+    
+    # Final validation pass - ensure end page >= start page for each section
+    for section in merged_sections:
+        if section.get("section_start_page") is not None and section.get("section_end_page") is not None:
+            if section["section_end_page"] < section["section_start_page"]:
+                logging.warning(f"  Fixing invalid page range for section {section['section_number']}: {section['section_start_page']}-{section['section_end_page']}")
+                section["section_end_page"] = section["section_start_page"]  # Ensure end page is at least the start page
+    
+    logging.info(f"  Applied page number extraction and inference to all sections")
 
 
     # 4. Process merged sections (enrichment, resumability check)
@@ -949,11 +1023,10 @@ def process_chapter_for_sections(
         if "section_hierarchy" not in final_section_data:
              final_section_data["section_hierarchy"] = generate_hierarchy_string(final_section_data)
 
-        # Add page numbers (needs logic if merge affects this - assume start/end from original section for now)
-        # TODO: Revisit page number logic if merging significantly changes span.
-        # For now, use chapter pages as fallback if section pages are missing after merge.
-        final_section_data["section_start_page"] = section_data.get("section_start_page", chapter_data.get("chapter_page_start"))
-        final_section_data["section_end_page"] = section_data.get("section_end_page", chapter_data.get("chapter_page_end"))
+        # Page numbers have already been extracted and filled in before this step
+        # Just ensure they're copied to the final section data
+        final_section_data["section_start_page"] = section_data.get("section_start_page")
+        final_section_data["section_end_page"] = section_data.get("section_end_page")
 
         # Ensure token count field name is consistent ('section_token_count' is expected after merge func)
         if "section_token_count" not in final_section_data:
