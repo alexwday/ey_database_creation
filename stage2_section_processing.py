@@ -100,6 +100,9 @@ logging.basicConfig(
     ]
 )
 
+# Silence overly verbose HTTPX logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ==============================================================================
 # Utility Functions (Self-Contained, adapted from Stage 1 and original scripts)
 # ==============================================================================
