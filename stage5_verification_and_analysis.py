@@ -81,6 +81,10 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD", "password") # Be cautious storing pa
 # --- Database Operations ---
 TARGET_TABLE = "guidance_sections"
 
+# --- SSL Configuration (Copied from other stages, potentially needed for tiktoken download) ---
+SSL_SOURCE_PATH = os.environ.get("SSL_SOURCE_PATH", "/path/to/your/rbc-ca-bundle.cer") # Adjust path if needed
+SSL_LOCAL_PATH = "/tmp/rbc-ca-bundle.cer" # Temp path for cert
+
 # --- Visualization ---
 CHART_FILENAME = "chunk_token_counts_by_chapter.png" # Updated filename
 CHART_TITLE = f"Distribution of Chunk Token Counts by Chapter ({DOCUMENT_ID})" # Updated title
@@ -107,6 +111,33 @@ logging.basicConfig(
 # ==============================================================================
 # Utility Functions
 # ==============================================================================
+
+# --- SSL Setup (Copied from Stage 3/4) ---
+_SSL_CONFIGURED = False
+
+def _setup_ssl(source_path=SSL_SOURCE_PATH, local_path=SSL_LOCAL_PATH) -> bool:
+    """Copies SSL cert locally and sets environment variables."""
+    global _SSL_CONFIGURED
+    if _SSL_CONFIGURED: return True
+    if not Path(source_path).is_file():
+         logging.warning(f"SSL source certificate not found at {source_path}. Network operations (like tiktoken download) may fail if HTTPS is required and cert is not already trusted.")
+         _SSL_CONFIGURED = True
+         return True # Allow proceeding, maybe cert is already trusted or not needed
+
+    logging.info("Setting up SSL certificate...")
+    try:
+        source = Path(source_path); local = Path(local_path)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        with open(source, "rb") as sf, open(local, "wb") as df: df.write(sf.read())
+        # Set environment variables for requests and potentially other libraries like tiktoken
+        os.environ["SSL_CERT_FILE"] = str(local)
+        os.environ["REQUESTS_CA_BUNDLE"] = str(local)
+        logging.info(f"SSL certificate configured successfully at: {local}")
+        _SSL_CONFIGURED = True
+        return True
+    except Exception as e:
+        logging.error(f"Error setting up SSL certificate: {e}", exc_info=True)
+        return False
 
 # --- Tokenizer (copied from Stage 3) ---
 _TOKENIZER = None
@@ -193,6 +224,11 @@ def check_sequence_continuity(numbers: List[int], item_name: str) -> List[str]:
 def run_stage5():
     """Main function to execute Stage 5 verification and analysis."""
     logging.info(f"--- Starting Stage 5: Verification & Analysis for {DOCUMENT_ID} ---")
+    # Setup SSL first in case tiktoken needs to download model files
+    if not _setup_ssl():
+         logging.warning("Proceeding without explicit SSL setup. tiktoken download might fail.")
+         # Continue anyway, maybe cert is already trusted or not needed
+
     verification_passed = True
     issues_found = []
 
