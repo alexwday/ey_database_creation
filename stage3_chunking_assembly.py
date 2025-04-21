@@ -84,6 +84,7 @@ SSL_LOCAL_PATH = "/tmp/rbc-ca-bundle.cer"
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 5 # seconds
 EMBEDDING_DIMENSIONS = 2000 # For text-embedding-3-large, adjust if using different model/size
+EMBEDDING_BATCH_SIZE = 32 # Number of texts to send in one embedding API call
 
 # --- Chunking/Merging Thresholds ---
 # TODO: Load from config or adjust as needed
@@ -165,33 +166,60 @@ def get_openai_client(base_url=BASE_URL) -> Optional[OpenAI]:
     except Exception as e: logging.error(f"Error creating OpenAI client: {e}", exc_info=True); return None
 
 # --- API Call (Embeddings) ---
-def get_embedding(text: str, client: OpenAI, model: str = MODEL_NAME_EMBEDDING, dimensions: Optional[int] = EMBEDDING_DIMENSIONS) -> Optional[List[float]]:
-    """Generates embedding for the given text with retry logic."""
-    if not client: logging.error("OpenAI client not available for embeddings."); return None
-    if not text: logging.warning("Empty text passed to get_embedding."); return None
+def get_embeddings_batch(texts: List[str], client: OpenAI, model: str = MODEL_NAME_EMBEDDING, dimensions: Optional[int] = EMBEDDING_DIMENSIONS) -> List[Optional[List[float]]]:
+    """Generates embeddings for a batch of texts with retry logic."""
+    if not client: logging.error("OpenAI client not available for embeddings."); return [None] * len(texts)
+    if not texts: logging.warning("Empty list passed to get_embeddings_batch."); return []
+    # Replace empty strings or None with a placeholder to avoid API errors, will return None embedding for these
+    processed_texts = [t if t and t.strip() else " " for t in texts]
+    original_indices_to_return_none = {i for i, t in enumerate(texts) if not t or not t.strip()}
+
     last_exception = None
-    embedding_params = {"input": [text], "model": model}
+    embedding_params = {"input": processed_texts, "model": model}
     if dimensions: embedding_params["dimensions"] = dimensions
 
     for attempt in range(API_RETRY_ATTEMPTS):
         try:
-            logging.debug(f"Requesting embedding (Attempt {attempt + 1}/{API_RETRY_ATTEMPTS})...")
+            logging.debug(f"Requesting embeddings for batch size {len(processed_texts)} (Attempt {attempt + 1}/{API_RETRY_ATTEMPTS})...")
             response = client.embeddings.create(**embedding_params)
-            embedding = response.data[0].embedding
+            # Sort embeddings by index to ensure correct order
+            embeddings_data = sorted(response.data, key=lambda e: e.index)
+            # Extract the embedding vectors
+            batch_embeddings = [e.embedding for e in embeddings_data]
+
             usage = response.usage
             if usage:
                 total_tokens = usage.total_tokens
                 cost = (total_tokens / 1000) * EMBEDDING_COST_PER_1K_TOKENS
-                logging.info(f"Embedding API Usage - Tokens: {total_tokens}, Cost: ${cost:.6f}")
-            logging.debug("Embedding received successfully.")
-            return embedding
+                logging.info(f"Embedding API Usage (Batch Size: {len(processed_texts)}) - Tokens: {total_tokens}, Cost: ${cost:.6f}")
+            logging.debug(f"Embeddings received successfully for batch size {len(processed_texts)}.")
+
+            # Ensure the number of embeddings matches the number of processed texts
+            if len(batch_embeddings) != len(processed_texts):
+                 logging.error(f"Mismatch between requested texts ({len(processed_texts)}) and received embeddings ({len(batch_embeddings)}).")
+                 # Fallback: return None for all in case of mismatch
+                 return [None] * len(texts)
+
+            # Reconstruct the final list, inserting None for originally empty texts
+            final_embeddings = []
+            current_embedding_idx = 0
+            for i in range(len(texts)):
+                if i in original_indices_to_return_none:
+                    final_embeddings.append(None)
+                else:
+                    final_embeddings.append(batch_embeddings[current_embedding_idx])
+                    current_embedding_idx += 1
+            return final_embeddings
+
         except APIError as e:
-            logging.warning(f"API Error on embedding attempt {attempt + 1}: {e}"); last_exception = e; time.sleep(API_RETRY_DELAY * (attempt + 1))
+            logging.warning(f"API Error on embedding batch attempt {attempt + 1}: {e}"); last_exception = e; time.sleep(API_RETRY_DELAY * (attempt + 1))
         except Exception as e:
-            logging.warning(f"Non-API Error on embedding attempt {attempt + 1}: {e}", exc_info=True); last_exception = e; time.sleep(API_RETRY_DELAY)
-    logging.error(f"Embedding generation failed after {API_RETRY_ATTEMPTS} attempts.")
+            logging.warning(f"Non-API Error on embedding batch attempt {attempt + 1}: {e}", exc_info=True); last_exception = e; time.sleep(API_RETRY_DELAY)
+
+    logging.error(f"Embedding batch generation failed after {API_RETRY_ATTEMPTS} attempts for batch size {len(processed_texts)}.")
     if last_exception: logging.error(f"Last error: {last_exception}")
-    return None
+    # Return None for all texts in the batch if all attempts fail
+    return [None] * len(texts)
 
 # --- File/Path Utils ---
 def create_directory(directory: str):
@@ -522,49 +550,67 @@ def run_stage3():
 
     # --- Final Assembly & Embedding Generation ---
     final_records = []
-    for i, chunk in enumerate(tqdm(final_merged_chunks, desc="Assembling & Embedding")):
-        sequence_num = i + 1
-        chunk['sequence_number'] = sequence_num
+    # Process embeddings in batches
+    num_chunks = len(final_merged_chunks)
+    for i in range(0, num_chunks, EMBEDDING_BATCH_SIZE):
+        batch_chunks = final_merged_chunks[i:min(i + EMBEDDING_BATCH_SIZE, num_chunks)]
+        batch_texts = [chunk.get('content', '') for chunk in batch_chunks]
 
-        # Generate embedding
-        embedding_vector = None
-        if client and chunk.get('content'):
-            embedding_vector = get_embedding(chunk['content'], client)
-            if embedding_vector is None:
-                logging.warning(f"Failed to generate embedding for chunk sequence {sequence_num}.")
+        batch_embeddings = []
+        if client and batch_texts:
+            logging.info(f"Generating embeddings for batch {i // EMBEDDING_BATCH_SIZE + 1} (size: {len(batch_texts)})...")
+            batch_embeddings = get_embeddings_batch(batch_texts, client)
         elif not client:
-             logging.debug(f"Skipping embedding for chunk {sequence_num} (no client).")
+            logging.debug(f"Skipping embedding generation for batch {i // EMBEDDING_BATCH_SIZE + 1} (no client).")
+            batch_embeddings = [None] * len(batch_chunks)
+        else: # No texts in batch
+             batch_embeddings = []
 
-        # Assemble final record matching schema (ensure all fields are present)
-        record = {
-            "document_id": chunk.get("document_id"),
-            "chapter_number": chunk.get("chapter_number"),
-            "section_number": chunk.get("section_number"),
-            "part_number": chunk.get("part_number"),
-            "sequence_number": sequence_num,
-            "chapter_name": chunk.get("chapter_name"),
-            "chapter_tags": chunk.get("chapter_tags"),
-            "chapter_summary": chunk.get("chapter_summary"),
-            "chapter_token_count": chunk.get("chapter_token_count"),
-            "section_start_page": chunk.get("section_start_page"),
-            "section_end_page": chunk.get("section_end_page"),
-            "section_importance_score": chunk.get("section_importance_score"),
-            "section_token_count": chunk.get("section_token_count"), # Token count of original section
-            "section_hierarchy": chunk.get("section_hierarchy"),
-            "section_title": chunk.get("section_title"),
-            "section_standard": chunk.get("section_standard"),
-            "section_standard_codes": chunk.get("section_standard_codes"),
-            "section_references": chunk.get("section_references"),
-            "content": chunk.get("content"),
-            "embedding": embedding_vector # This will be None if generation failed
-            # DB handles: id, created_at, text_search_vector
-        }
-        # Remove any intermediate fields if they accidentally carried over
-        record.pop("level", None) 
-        record.pop("chunk_token_count", None)  # Remove internal field not in final schema
-        for i in range(1, 7): record.pop(f"level_{i}", None)
+        # Assign sequence numbers and assemble records for the current batch
+        for j, chunk in enumerate(tqdm(batch_chunks, desc=f"Batch {i // EMBEDDING_BATCH_SIZE + 1} Assembly", leave=False)):
+            # Calculate global sequence number
+            sequence_num = i + j + 1
+            chunk['sequence_number'] = sequence_num
 
-        final_records.append(record)
+            # Get the corresponding embedding from the batch result
+            embedding_vector = batch_embeddings[j] if j < len(batch_embeddings) else None
+            if embedding_vector is None and chunk.get('content'):
+                 # Log warning only if content existed but embedding failed/was None
+                 logging.warning(f"Embedding is None for chunk sequence {sequence_num}.")
+
+            # Assemble final record matching schema (ensure all fields are present)
+            record = {
+                "document_id": chunk.get("document_id"),
+                "chapter_number": chunk.get("chapter_number"),
+                "section_number": chunk.get("section_number"),
+                "part_number": chunk.get("part_number"),
+                "sequence_number": sequence_num,
+                "chapter_name": chunk.get("chapter_name"),
+                "chapter_tags": chunk.get("chapter_tags"),
+                "chapter_summary": chunk.get("chapter_summary"),
+                "chapter_token_count": chunk.get("chapter_token_count"),
+                "section_start_page": chunk.get("section_start_page"),
+                "section_end_page": chunk.get("section_end_page"),
+                "section_importance_score": chunk.get("section_importance_score"),
+                "section_token_count": chunk.get("section_token_count"), # Token count of original section
+                "section_hierarchy": chunk.get("section_hierarchy"),
+                "section_title": chunk.get("section_title"),
+                "section_standard": chunk.get("section_standard"),
+                "section_standard_codes": chunk.get("section_standard_codes"),
+                "section_references": chunk.get("section_references"),
+                "content": chunk.get("content"),
+                "embedding": embedding_vector # This will be None if generation failed or skipped
+                # DB handles: id, created_at, text_search_vector
+            }
+            # Remove any intermediate fields if they accidentally carried over
+            record.pop("level", None)
+            record.pop("chunk_token_count", None)  # Remove internal field not in final schema
+            # Remove start/end pos if they exist from earlier steps (should be None anyway)
+            record.pop("start_pos", None)
+            record.pop("end_pos", None)
+            for k in range(1, 7): record.pop(f"level_{k}", None) # Use k to avoid shadowing loop var
+
+            final_records.append(record)
 
     # --- Save Output ---
     output_filepath = Path(OUTPUT_DIR) / OUTPUT_FILENAME
