@@ -32,6 +32,12 @@ from pgvector.psycopg2 import register_vector
 import json # For parsing GPT relevance response
 import itertools # For grouping in gap filling
 from tabulate import tabulate # For better table printing
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
+    print("WARNING: tiktoken not installed. Token counts will be estimated (chars/4). `pip install tiktoken`")
+
 
 # --- Configuration ---
 # --- Search & Refinement Configuration ---
@@ -87,6 +93,31 @@ SSL_LOCAL_PATH = "/tmp/rbc-ca-bundle.cer" # Temporary local path for cert
 _SSL_CONFIGURED = False # Flag to avoid redundant SSL setup
 _RETRY_ATTEMPTS = 3
 _RETRY_DELAY = 5 # seconds
+
+# --- Helper Functions (Tokenizer) ---
+_TOKENIZER = None
+if tiktoken:
+    try:
+        # Using cl100k_base as it's common for models like GPT-4, GPT-3.5
+        _TOKENIZER = tiktoken.get_encoding("cl100k_base")
+        print("Using 'cl100k_base' tokenizer for token counting.")
+    except Exception as e:
+        print(f"WARNING: Failed tokenizer init: {e}. Estimating tokens.")
+        _TOKENIZER = None
+
+def count_tokens(text: str) -> int:
+    """Counts tokens using tiktoken or estimates if unavailable/fails."""
+    if not text: return 0
+    if _TOKENIZER:
+        try:
+            return len(_TOKENIZER.encode(text))
+        except Exception as e:
+            # Fallback to estimation on encoding error
+            print(f"WARNING: tiktoken encode error: {e}. Estimating tokens for this text.")
+            return len(text) // 4 # Estimate
+    else:
+        # Fallback if tiktoken is not installed
+        return len(text) // 4 # Estimate
 
 # --- Helper Functions (Database Connection) ---
 
@@ -524,8 +555,41 @@ def expand_sections_by_token_count(cursor, results: list[dict], top_k_rank: int,
         for row in expansion_log_data:
             print(f"ID: {row[0]}, Rank: {row[1]}, Tokens: {row[2]}, Threshold: {row[3]}, Action: {row[4]}, Added: {row[5]}") # Updated print
 
-    print(f"Finished section expansion. Result count: {len(processed_results)} (items/groups). Added {len(added_chunk_ids)} new chunks.")
-    return processed_results, added_chunk_ids
+    print(f"Finished section expansion. Intermediate result count: {len(processed_results)} (items/groups). Added {len(added_chunk_ids)} new chunks.")
+
+    # --- Second Pass: Filter out single chunks now contained within groups ---
+    print("\n--- Filtering expanded chunks from results list ---")
+    final_processed_results = []
+    grouped_chunk_ids = set()
+
+    # Identify all chunk IDs within groups
+    for item in processed_results:
+        if isinstance(item, dict) and item.get('type') == 'group':
+            for chunk in item.get('chunks', []):
+                if chunk.get('id'):
+                    grouped_chunk_ids.add(chunk.get('id'))
+
+    # Add items to final list, skipping single chunks that are now in groups
+    skipped_singles = 0
+    for item in processed_results:
+        if isinstance(item, dict) and item.get('type') == 'group':
+            final_processed_results.append(item) # Keep groups
+        elif isinstance(item, dict): # It's a single chunk
+            chunk_id = item.get('id')
+            if chunk_id in grouped_chunk_ids:
+                print(f"  - Filtering out single chunk ID {chunk_id} (Rank: {item.get('rank', 'N/A')}) as it's included in an expanded group.")
+                skipped_singles += 1
+                continue # Skip this single chunk
+            else:
+                final_processed_results.append(item) # Keep this single chunk
+        else:
+             print(f"WARNING: Unexpected item type during final expansion filtering: {type(item)}")
+             final_processed_results.append(item) # Keep unknown items
+
+    print(f"Finished filtering. Removed {skipped_singles} single chunks already covered by groups.")
+    print(f"Final count after expansion and filtering: {len(final_processed_results)}")
+
+    return final_processed_results, added_chunk_ids # Return the properly filtered list
 
 # Function name already updated in previous step, ensure logic matches
 def fill_sequence_gaps(cursor, results: list[dict | list[dict]], max_seq_gap: int) -> tuple[list[dict | list[dict]], set]:
