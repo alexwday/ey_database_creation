@@ -327,7 +327,8 @@ def merge_sections_pass1(sections: List[Dict], min_tokens: int, max_tokens: int)
                 merged_data = current.copy()
                 merged_data["cleaned_section_content"] = f"{current.get('cleaned_section_content', '')}\n\n{next_s.get('cleaned_section_content', '')}"
                 merged_data["section_token_count"] = count_tokens(merged_data["cleaned_section_content"])
-                merged_data["raw_section_slice_end_pos"] = next_s["raw_section_slice_end_pos"]
+                # Use .get() for safe access, fallback to end_pos if slice key missing
+                merged_data["raw_section_slice_end_pos"] = next_s.get("raw_section_slice_end_pos", next_s.get("end_pos"))
                 merged_data["section_end_page"] = max(current.get("section_end_page", 0), next_s.get("section_end_page", 0))
                 # TODO: Merge other fields like tags, codes, references? For now, keep first section's.
                 merged_sections.append(merged_data)
@@ -343,7 +344,8 @@ def merge_sections_pass1(sections: List[Dict], min_tokens: int, max_tokens: int)
                 logging.debug(f"Merging section {current.get('section_number')} backward into {prev_s.get('section_number')}")
                 prev_s["cleaned_section_content"] = f"{prev_s.get('cleaned_section_content', '')}\n\n{current.get('cleaned_section_content', '')}"
                 prev_s["section_token_count"] = count_tokens(prev_s["cleaned_section_content"])
-                prev_s["raw_section_slice_end_pos"] = current["raw_section_slice_end_pos"]
+                # Use .get() for safe access, fallback to end_pos if slice key missing
+                prev_s["raw_section_slice_end_pos"] = current.get("raw_section_slice_end_pos", current.get("end_pos"))
                 prev_s["section_end_page"] = max(prev_s.get("section_end_page", 0), current.get("section_end_page", 0))
                 # TODO: Merge other fields?
                 i += 1; merged_pass1 = True
