@@ -82,10 +82,15 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD", "password") # Be cautious storing pa
 TARGET_TABLE = "guidance_sections"
 
 # --- Visualization ---
-CHART_FILENAME = "section_token_counts_by_chapter.png"
-CHART_TITLE = f"Distribution of Section Token Counts by Chapter ({DOCUMENT_ID})"
+CHART_FILENAME = "chunk_token_counts_by_chapter.png" # Updated filename
+CHART_TITLE = f"Distribution of Chunk Token Counts by Chapter ({DOCUMENT_ID})" # Updated title
 FIG_WIDTH = 10 # inches
 FIG_HEIGHT_PER_CHAPTER = 0.5 # inches per chapter for tall chart
+
+# --- Analysis Thresholds (based on Stage 3) ---
+# Use thresholds from Stage 3 config to identify outliers
+CHUNK_MERGE_THRESHOLD = 50
+CHUNK_SPLIT_MAX_TOKENS = 750
 
 # --- Logging Setup ---
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -103,6 +108,28 @@ logging.basicConfig(
 # Utility Functions
 # ==============================================================================
 
+# --- Tokenizer (copied from Stage 3) ---
+_TOKENIZER = None
+if 'tiktoken' in sys.modules and sys.modules['tiktoken']: # Check if tiktoken was imported successfully
+    tiktoken = sys.modules['tiktoken']
+    try:
+        _TOKENIZER = tiktoken.get_encoding("cl100k_base")
+        logging.info("Using 'cl100k_base' tokenizer via tiktoken.")
+    except Exception as e:
+        logging.warning(f"Failed to initialize tiktoken tokenizer: {e}. Falling back to estimate.")
+        _TOKENIZER = None
+else:
+     logging.warning("tiktoken library not available. Estimating tokens using char/4.")
+
+def count_tokens(text: str) -> int:
+    """Counts tokens using tiktoken if available, otherwise estimates (chars/4)."""
+    if not text: return 0
+    if _TOKENIZER:
+        try: return len(_TOKENIZER.encode(text))
+        except Exception: return len(text) // 4 # Fallback if encoding fails
+    else: return len(text) // 4 # Fallback if tiktoken not loaded
+
+# --- Database Connection ---
 def get_db_connection():
     """Establishes and returns a PostgreSQL database connection."""
     if not psycopg2:
@@ -220,6 +247,17 @@ def run_stage5():
     # Convert to DataFrame
     df = pd.DataFrame([dict(row) for row in db_records])
 
+    # --- Calculate Chunk Token Counts ---
+    logging.info("Calculating token count for each chunk's content...")
+    if 'content' in df.columns:
+        df['chunk_token_count'] = df['content'].apply(lambda x: count_tokens(str(x)) if pd.notna(x) else 0)
+        logging.info("Chunk token counts calculated.")
+    else:
+        logging.error("Column 'content' not found in data. Cannot calculate chunk token counts.")
+        issues_found.append("Cannot calculate chunk token counts: 'content' column missing.")
+        # Allow verification to continue, but analysis/visualization will be limited
+        df['chunk_token_count'] = 0 # Add dummy column to prevent later errors
+
     # --- Verification Checks ---
 
     # 1. Record Count Verification
@@ -291,37 +329,70 @@ def run_stage5():
     if part_continuity_ok:
         logging.info("[PASS] part_number sequences appear continuous where sections have multiple parts.")
 
-    # --- Token Count Visualization ---
-    logging.info("Generating section token count visualization...")
+    # --- Token Count Analysis & Visualization ---
+    logging.info("Analyzing and visualizing chunk token counts...")
     chart_path = Path(OUTPUT_DIR) / CHART_FILENAME
-    try:
-        # Ensure 'section_token_count' exists and handle potential NaNs if necessary
-        if 'section_token_count' not in df.columns:
-             logging.error("Column 'section_token_count' not found in data. Cannot generate visualization.")
-             issues_found.append("Cannot generate token visualization: 'section_token_count' column missing.")
-        else:
-            # Drop rows where token count might be NaN/None before plotting
-            plot_df = df.dropna(subset=['chapter_number', 'section_token_count'])
-            plot_df['chapter_number'] = plot_df['chapter_number'].astype(int) # Ensure chapter is int for sorting
-            plot_df['section_token_count'] = plot_df['section_token_count'].astype(int)
+    if 'chunk_token_count' in df.columns and df['chunk_token_count'].sum() > 0: # Check if we have counts
+        try:
+            # Overall Stats
+            overall_stats = df['chunk_token_count'].describe()
+            logging.info("--- Overall Chunk Token Count Stats ---")
+            logging.info(f"Min: {overall_stats['min']:.0f}, Max: {overall_stats['max']:.0f}")
+            logging.info(f"Mean: {overall_stats['mean']:.2f}, Median: {overall_stats['50%']:.0f}")
+            logging.info(f"Std Dev: {overall_stats['std']:.2f}")
+
+            # Per-Chapter Stats
+            logging.info("--- Per-Chapter Chunk Token Count Stats ---")
+            chapter_stats = df.groupby('chapter_number').agg(
+                num_sections=('section_number', 'nunique'),
+                num_chunks=('sequence_number', 'count'), # Count chunks per chapter
+                total_chunk_tokens=('chunk_token_count', 'sum'),
+                min_chunk_tokens=('chunk_token_count', 'min'),
+                max_chunk_tokens=('chunk_token_count', 'max'),
+                mean_chunk_tokens=('chunk_token_count', 'mean')
+            )
+            logging.info("\n" + chapter_stats.to_string()) # Print DataFrame to log
+
+            # Identify Outlier Chunks
+            outlier_low = df[df['chunk_token_count'] < CHUNK_MERGE_THRESHOLD]
+            outlier_high = df[df['chunk_token_count'] > CHUNK_SPLIT_MAX_TOKENS]
+            if not outlier_low.empty:
+                logging.warning(f"[WARN] Found {len(outlier_low)} chunks with token count < {CHUNK_MERGE_THRESHOLD}:")
+                for idx, row in outlier_low.iterrows():
+                    logging.warning(f"  - Seq: {row['sequence_number']}, Tokens: {row['chunk_token_count']}")
+                issues_found.append(f"Found {len(outlier_low)} chunks below merge threshold ({CHUNK_MERGE_THRESHOLD} tokens).")
+            if not outlier_high.empty:
+                logging.warning(f"[WARN] Found {len(outlier_high)} chunks with token count > {CHUNK_SPLIT_MAX_TOKENS}:")
+                for idx, row in outlier_high.iterrows():
+                    logging.warning(f"  - Seq: {row['sequence_number']}, Tokens: {row['chunk_token_count']}")
+                issues_found.append(f"Found {len(outlier_high)} chunks above split threshold ({CHUNK_SPLIT_MAX_TOKENS} tokens).")
+
+
+            # Visualization
+            plot_df = df.dropna(subset=['chapter_number', 'chunk_token_count'])
+            plot_df['chapter_number'] = plot_df['chapter_number'].astype(int)
 
             num_chapters = plot_df['chapter_number'].nunique()
-            fig_height = max(5, num_chapters * FIG_HEIGHT_PER_CHAPTER) # Ensure minimum height
+            fig_height = max(5, num_chapters * FIG_HEIGHT_PER_CHAPTER)
 
             plt.figure(figsize=(FIG_WIDTH, fig_height))
-            sns.boxplot(y='chapter_number', x='section_token_count', data=plot_df, orient='h', order=sorted(plot_df['chapter_number'].unique()))
-            plt.title(CHART_TITLE)
-            plt.xlabel("Section Token Count")
+            sns.boxplot(y='chapter_number', x='chunk_token_count', data=plot_df, orient='h', order=sorted(plot_df['chapter_number'].unique()))
+            plt.title(CHART_TITLE) # Use updated title
+            plt.xlabel("Chunk Token Count") # Updated label
             plt.ylabel("Chapter Number")
+            # Add vertical lines for thresholds
+            plt.axvline(x=CHUNK_MERGE_THRESHOLD, color='red', linestyle='--', linewidth=0.8, label=f'Merge Threshold ({CHUNK_MERGE_THRESHOLD})')
+            plt.axvline(x=CHUNK_SPLIT_MAX_TOKENS, color='orange', linestyle='--', linewidth=0.8, label=f'Split Target ({CHUNK_SPLIT_MAX_TOKENS})')
+            plt.legend(fontsize='small')
             plt.tight_layout()
             plt.savefig(chart_path)
-            plt.close() # Close plot to free memory
-            logging.info(f"Token count visualization saved to: {chart_path}")
-            issues_found.append(f"Token count visualization saved to: {chart_path}") # Add info to report
+            plt.close()
+            logging.info(f"Chunk token count visualization saved to: {chart_path}")
+            issues_found.append(f"Chunk token count visualization saved to: {chart_path}")
 
-    except Exception as e:
-        logging.error(f"Error generating token count visualization: {e}", exc_info=True)
-        issues_found.append(f"Failed to generate token count visualization: {e}")
+        except Exception as e:
+            logging.error(f"Error during token count analysis or visualization: {e}", exc_info=True)
+            issues_found.append(f"Failed token count analysis/visualization: {e}")
         # Don't fail overall verification just for chart failure
         # verification_passed = False
 
