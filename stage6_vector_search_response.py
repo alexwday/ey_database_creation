@@ -1085,22 +1085,37 @@ def generate_response(query: str):
                 print(f"Rank: {row[0]}, ID: {row[1]}, Chapter: {row[2]}, Score: {row[3]}")
         print("-" * 80)
 
-        # --- Log Unique Chapters & Summaries from Top K ---
-        print("\n--- Unique Chapters & Summaries in Initial Top K Results ---")
-        unique_chapters = {}
+        # --- Log Unique Sections & Summaries from Top K ---
+        print("\n--- Unique Sections & Summaries in Initial Top K Results ---") # Updated title
+        unique_sections = {} # Use a set to store unique tuples
         for record in initial_results:
             chapter_name = record.get('chapter_name', 'N/A')
+            section_hierarchy = record.get('section_hierarchy', 'N/A')
             # WORKAROUND: Use chapter_summary which holds section summary
-            summary = record.get('chapter_summary', 'N/A')
-            if chapter_name not in unique_chapters:
-                unique_chapters[chapter_name] = summary
-        
-        unique_chapter_data = [[name, summary[:100] + ("..." if len(summary)>100 else "")] for name, summary in unique_chapters.items()]
+            summary = record.get('chapter_summary', '') # Use empty string if None
+            # Create a unique key based on chapter, hierarchy, and summary
+            section_key = (chapter_name, section_hierarchy, summary)
+            if section_key not in unique_sections:
+                 # Store the full data for easy access later, only add if key is new
+                 unique_sections[section_key] = {
+                     'chapter': chapter_name,
+                     'hierarchy': section_hierarchy,
+                     'summary': summary
+                 }
+
+        # Prepare data for tabulation
+        unique_section_data_for_table = [
+            [data['chapter'], data['hierarchy'], data['summary'][:100] + ("..." if len(data['summary'])>100 else "")]
+            for data in unique_sections.values()
+        ]
+        # Sort data for consistent output (optional, but helpful)
+        unique_section_data_for_table.sort(key=lambda x: (x[0], x[1]))
+
         try:
-            print(tabulate(unique_chapter_data, headers=["Chapter Name", "Section Summary (Truncated)"], tablefmt="grid"))
+            print(tabulate(unique_section_data_for_table, headers=["Chapter", "Section Hierarchy", "Section Summary (Truncated)"], tablefmt="grid"))
         except ImportError:
              print("WARN: 'tabulate' library not found.")
-             for name, summary in unique_chapter_data: print(f"- {name}: {summary}")
+             for row in unique_section_data_for_table: print(f"- Ch: {row[0]}, Hier: {row[1]}, Sum: {row[2]}")
         print("-" * 80)
 
 
