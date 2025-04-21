@@ -58,6 +58,9 @@ MAX_RESPONSE_TOKENS = 4000
 # Temperature for response generation
 RESPONSE_TEMPERATURE = 0.7
 
+# --- Target Table ---
+TARGET_TABLE = "guidance_sections" # Name of the table containing chunks
+
 # --- Embedding Configuration ---
 EMBEDDING_MODEL = "text-embedding-3-large"
 EMBEDDING_DIMENSIONS = 2000
@@ -274,20 +277,20 @@ def perform_hybrid_search(cursor, query: str, query_embedding: list[float], init
         # This ratio can be adjusted based on your requirements
         sql = f"""
             WITH vector_results AS (
-                SELECT 
+                SELECT
                     id,
                     1 - (embedding <=> %s::vector) AS vector_score -- Using cosine distance operator
-                FROM guidance_sections -- UPDATED TABLE NAME
+                FROM {TARGET_TABLE} -- Use config variable
                 WHERE 1=1
                 {" AND document_id = %s" if doc_id else ""}
             ),
             text_results AS (
-                SELECT 
+                SELECT
                     id,
                     -- Keyword search removed
                     id,
                     0.0 AS text_score -- Placeholder, not used
-                FROM guidance_sections -- UPDATED TABLE NAME
+                FROM {TARGET_TABLE} -- Use config variable
                 WHERE 1=0 -- Ensure this CTE returns no rows
                 -- {" AND document_id = %s" if doc_id else ""} -- Not needed
             ),
@@ -311,7 +314,7 @@ def perform_hybrid_search(cursor, query: str, query_embedding: list[float], init
                     COALESCE(v.vector_score, 0) AS vector_score,
                     0.0 AS text_score, -- Placeholder
                     COALESCE(v.vector_score, 0) AS combined_score -- Score is just vector score now
-                FROM guidance_sections c -- UPDATED TABLE NAME
+                FROM {TARGET_TABLE} c -- Use config variable
                 LEFT JOIN vector_results v ON c.id = v.id
                 -- LEFT JOIN text_results t ON c.id = t.id -- Removed text results join
                 WHERE COALESCE(v.vector_score, 0) > 0 -- Only need vector score > 0
@@ -402,6 +405,11 @@ Provide your response as a single JSON object mapping each ID to 1 (relevant) or
                 temperature=0.2, # Low temperature for classification
                 response_format={"type": "json_object"} # Request JSON output
             )
+            # Add safety check for empty choices list
+            if not response.choices:
+                print(f"ERROR: API returned empty choices list during relevance check (Attempt {attempt + 1}).", file=sys.stderr)
+                raise APIError("Empty choices list received from API", response=response, body=None) # Raise APIError to trigger retry
+
             response_content = response.choices[0].message.content
             relevance_map = json.loads(response_content)
             # Validate format (simple check)
@@ -514,8 +522,8 @@ def expand_sections_by_token_count(cursor, results: list[dict], top_k_rank: int,
         if should_expand:
             try:
                 # Fetch all chunks for the section if expansion is needed
-                sql = """
-                    SELECT * FROM guidance_sections -- UPDATED TABLE NAME
+                sql = f"""
+                    SELECT * FROM {TARGET_TABLE} -- Use config variable
                     WHERE document_id = %s AND chapter_name = %s AND section_hierarchy = %s
                     ORDER BY sequence_number;
                 """
@@ -643,8 +651,8 @@ def fill_sequence_gaps(cursor, results: list[dict | list[dict]], max_seq_gap: in
                 # Check if gap is within threshold and positive
                 if 0 < seq_gap <= max_seq_gap:
                     try:
-                        sql = """
-                            SELECT * FROM guidance_sections -- UPDATED TABLE NAME
+                        sql = f"""
+                            SELECT * FROM {TARGET_TABLE} -- Use config variable
                             WHERE document_id = %s AND sequence_number > %s AND sequence_number < %s
                             ORDER BY sequence_number;
                         """
@@ -744,13 +752,18 @@ def rerank_by_importance(results: list[dict | list[dict]], importance_factor: fl
     rerank_log_data = []
     headers_rerank = ["New Rank", "Orig Rank", "Chunk ID", "Orig Score", "Importance", "New Score"]
     final_reranked_list = []
+    # Store original ranks before sorting and overwriting
+    original_ranks = {item.get('id'): item.get('rank') for item in items_with_scores if item.get('id')}
+
     for new_rank, item in enumerate(items_with_scores, 1):
+        item_id = item.get('id')
+        orig_rank = original_ranks.get(item_id, 'N/A') # Get original rank safely
         item['rank'] = new_rank # Overwrite original rank with new rank
         final_reranked_list.append(item)
         rerank_log_data.append([
             new_rank,
-            item.get('rank'), # This is the original rank before overwrite
-            item.get('id', 'N/A'),
+            orig_rank, # Use the stored original rank for logging
+            item_id,
             f"{item.get('vector_score', 0.0):.4f}",
             f"{item.get('section_importance_score', 0.0):.2f}",
             f"{item.get('new_score', 0.0):.4f}"
@@ -945,6 +958,11 @@ Based ONLY on the context cards provided above, please answer the user's questio
             )
 
             print("API call for response generation successful.")
+            # Add safety check for empty choices list
+            if not response.choices:
+                print(f"ERROR: API returned empty choices list during final response generation (Attempt {attempt + 1}).", file=sys.stderr)
+                raise APIError("Empty choices list received from API", response=response, body=None) # Raise APIError to trigger retry
+
             response_content = response.choices[0].message.content
 
             # Print token usage information
