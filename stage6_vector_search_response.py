@@ -251,84 +251,25 @@ def perform_hybrid_search(cursor, query: str, query_embedding: list[float], init
         return results
 
     try:
-        # Check if websearch_to_tsquery is available (PostgreSQL 11+)
-        cursor.execute("SELECT 1 FROM pg_proc WHERE proname = 'websearch_to_tsquery'")
-        has_websearch = cursor.fetchone() is not None
-        
-        # Use websearch_to_tsquery if available, fall back to to_tsquery
-        if has_websearch:
-            print("Using websearch_to_tsquery for keyword component...")
-            tsquery_func = "websearch_to_tsquery"
-            # Keep original query for websearch_to_tsquery as it handles operators
-            search_query = query
-        else:
-            print("Using to_tsquery for keyword component...")
-            tsquery_func = "to_tsquery"
-            # Extract words, filter out very short ones
-            words = [w for w in query.strip().split() if len(w) > 2]
-            if not words:
-                words = query.strip().split()  # Use all words if filtering removed everything
-            # Create OR-based query to find documents with ANY of the keywords
-            search_query = ' | '.join(words)
-            print(f"Using OR-based query: {search_query}")
+        # REMOVED: Text search preparation logic.
 
-        # Hybrid search SQL combining vector and keyword components
-        # Weighting: 0.7 for vector similarity, 0.3 for text search relevance
-        # This ratio can be adjusted based on your requirements
+        # Vector-only search SQL - Simplified
         sql = f"""
-            WITH vector_results AS (
-                SELECT
-                    id,
-                    1 - (embedding <=> %s::vector) AS vector_score -- Using cosine distance operator
-                FROM {TARGET_TABLE} -- Use config variable
-                WHERE 1=1
-                {" AND document_id = %s" if doc_id else ""}
-            ),
-            text_results AS (
-                SELECT
-                    id,
-                    -- Keyword search removed
-                    id,
-                    0.0 AS text_score -- Placeholder, not used
-                FROM {TARGET_TABLE} -- Use config variable
-                WHERE 1=0 -- Ensure this CTE returns no rows
-                -- {" AND document_id = %s" if doc_id else ""} -- Not needed
-            ),
-            combined_results AS (
-                SELECT 
-                    c.id,
-                    c.sequence_number,
-                    c.document_id,
-                    c.chapter_name,
-                    c.section_hierarchy,         # From schema
-                    c.section_title,             # From schema
-                    c.content,                   # From schema
-                    c.chapter_summary,           # Using this for section summary (WORKAROUND)
-                    c.section_standard,          # From schema
-                    c.section_standard_codes,    # From schema
-                    c.chapter_tags,              # Using chapter tags (schema has no section tags)
-                    c.section_start_page,        # From schema
-                    c.section_end_page,          # From schema
-                    c.section_importance_score,  # From schema
-                    c.section_token_count,       # From schema
-                    COALESCE(v.vector_score, 0) AS vector_score,
-                    0.0 AS text_score, -- Placeholder
-                    COALESCE(v.vector_score, 0) AS combined_score -- Score is just vector score now
-                FROM {TARGET_TABLE} c -- Use config variable
-                LEFT JOIN vector_results v ON c.id = v.id
-                -- LEFT JOIN text_results t ON c.id = t.id -- Removed text results join
-                WHERE COALESCE(v.vector_score, 0) > 0 -- Only need vector score > 0
-            )
-            SELECT * FROM combined_results -- Select all columns from guidance_sections + scores
-            ORDER BY vector_score DESC -- Order by vector score only
+            SELECT
+                c.*, -- Select all columns from the target table
+                1 - (c.embedding <=> %s::vector) AS vector_score -- Calculate vector score directly
+            FROM {TARGET_TABLE} c -- Use config variable
+            WHERE 1=1
+            {" AND c.document_id = %s" if doc_id else ""}
+            ORDER BY vector_score DESC -- Order by vector score
             LIMIT %s; -- Use initial_k for the limit
         """
 
         # Prepare parameters for vector search only
-        params = [query_embedding, initial_k]
+        params = [query_embedding] # Start with embedding
         if doc_id:
-            # Insert document_id parameter for vector query
-            params = [query_embedding, doc_id, initial_k]
+            params.append(doc_id) # Add doc_id if provided
+        params.append(initial_k) # Add limit
 
         cursor.execute(sql, params)
         results = cursor.fetchall()
