@@ -89,7 +89,7 @@ EMBEDDING_BATCH_SIZE = 32 # Number of texts to send in one embedding API call
 # --- Chunking/Merging Thresholds ---
 # TODO: Load from config or adjust as needed
 SECTION_MIN_TOKENS = 250 # Sections below this might be merged in Pass 1
-SECTION_MAX_TOKENS = 1500 # Sections above this trigger splitting
+SECTION_MAX_TOKENS = 750 # Sections above this trigger splitting (Aligned with CHUNK_SPLIT_MAX_TOKENS)
 CHUNK_MERGE_THRESHOLD = 50 # Ultra-small chunks below this merged in Pass 2
 CHUNK_SPLIT_MAX_TOKENS = 750 # Target max tokens for chunks *after* splitting
 
