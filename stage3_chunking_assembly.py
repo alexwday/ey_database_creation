@@ -587,7 +587,8 @@ def run_stage3():
                 "sequence_number": sequence_num,
                 "chapter_name": chunk.get("chapter_name"),
                 "chapter_tags": chunk.get("chapter_tags"),
-                "chapter_summary": chunk.get("chapter_summary"),
+                # WORKAROUND: Use section_summary from input for the chapter_summary field in output/DB
+                "chapter_summary": chunk.get("section_summary"), # Changed from chunk.get("chapter_summary")
                 "chapter_token_count": chunk.get("chapter_token_count"),
                 "section_start_page": chunk.get("section_start_page"),
                 "section_end_page": chunk.get("section_end_page"),
