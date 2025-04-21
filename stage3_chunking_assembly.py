@@ -285,58 +285,7 @@ def split_large_section_content(cleaned_content: str, max_tokens: int = CHUNK_SP
     return split_sub_chunks
 
 # --- Merging Logic ---
-def merge_sections_pass1(sections: List[Dict], min_tokens: int, max_tokens: int) -> List[Dict]:
-    """Merges sections smaller than min_tokens (Pass 1)."""
-    if not sections: return []
-    # Assumes sections are sorted by section_number within chapter
-    merged_sections = []
-    i = 0
-    while i < len(sections):
-        current = sections[i]
-        current_tokens = current.get("section_token_count", 0)
-
-        if current_tokens >= min_tokens:
-            merged_sections.append(current); i += 1; continue
-
-        merged_pass1 = False
-        # Try merge forward (same level)
-        if i + 1 < len(sections):
-            next_s = sections[i + 1]
-            next_tokens = next_s.get("section_token_count", 0)
-            if (current.get("chapter_number") == next_s.get("chapter_number") and
-                current.get("level") == next_s.get("level") and
-                current_tokens + next_tokens <= max_tokens):
-                logging.debug(f"Merging section {current.get('section_number')} forward into {next_s.get('section_number')}")
-                merged_data = current.copy()
-                merged_data["cleaned_section_content"] = f"{current.get('cleaned_section_content', '')}\n\n{next_s.get('cleaned_section_content', '')}"
-                merged_data["section_token_count"] = count_tokens(merged_data["cleaned_section_content"])
-                # Use .get() for safe access, fallback to end_pos if slice key missing
-                merged_data["raw_section_slice_end_pos"] = next_s.get("raw_section_slice_end_pos", next_s.get("end_pos"))
-                merged_data["section_end_page"] = max(current.get("section_end_page", 0), next_s.get("section_end_page", 0))
-                # TODO: Merge other fields like tags, codes, references? For now, keep first section's.
-                merged_sections.append(merged_data)
-                i += 2; merged_pass1 = True
-
-        # Try merge backward (same or deeper level)
-        if not merged_pass1 and merged_sections:
-            prev_s = merged_sections[-1]
-            prev_tokens = prev_s.get("section_token_count", 0)
-            if (current.get("chapter_number") == prev_s.get("chapter_number") and
-                current.get("level", 1) >= prev_s.get("level", 1) and
-                prev_tokens + current_tokens <= max_tokens):
-                logging.debug(f"Merging section {current.get('section_number')} backward into {prev_s.get('section_number')}")
-                prev_s["cleaned_section_content"] = f"{prev_s.get('cleaned_section_content', '')}\n\n{current.get('cleaned_section_content', '')}"
-                prev_s["section_token_count"] = count_tokens(prev_s["cleaned_section_content"])
-                # Use .get() for safe access, fallback to end_pos if slice key missing
-                prev_s["raw_section_slice_end_pos"] = current.get("raw_section_slice_end_pos", current.get("end_pos"))
-                prev_s["section_end_page"] = max(prev_s.get("section_end_page", 0), current.get("section_end_page", 0))
-                # TODO: Merge other fields?
-                i += 1; merged_pass1 = True
-
-        if not merged_pass1:
-            merged_sections.append(current); i += 1
-
-    return merged_sections
+# Removing merge_sections_pass1 as it's redundant with Stage 2 merging.
 
 def merge_chunks_pass2(chunks: List[Dict], small_threshold: int, max_tokens: int) -> List[Dict]:
     """Merges ultra-small chunks (Pass 2)."""
@@ -491,9 +440,11 @@ def run_stage3():
         # Sort sections within chapter by section_number
         chapter_sections.sort(key=lambda s: s.get('section_number', 0))
 
-        # 1. Merge Small Sections (Pass 1)
-        merged_sections = merge_sections_pass1(chapter_sections, SECTION_MIN_TOKENS, SECTION_MAX_TOKENS)
-        logging.info(f"Chapter {chapter_num}: {len(chapter_sections)} sections -> {len(merged_sections)} after Pass 1 merge.")
+        # 1. Merge Small Sections (Pass 1) - Removed this call as it's redundant with Stage 2.
+        # merged_sections = merge_sections_pass1(chapter_sections, SECTION_MIN_TOKENS, SECTION_MAX_TOKENS)
+        # logging.info(f"Chapter {chapter_num}: {len(chapter_sections)} sections -> {len(merged_sections)} after Pass 1 merge.")
+        # Use the sections directly from Stage 2 output for splitting/chunking
+        merged_sections = chapter_sections # Rename variable for clarity downstream
 
         # 2. Split Large Sections & Assemble Initial Chunks
         raw_chapter_content = get_raw_chapter_content(chapter_num, ORIGINAL_MD_DIR)
