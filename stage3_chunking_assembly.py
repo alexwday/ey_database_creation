@@ -199,26 +199,9 @@ def create_directory(directory: str):
     Path(directory).mkdir(parents=True, exist_ok=True)
 
 # --- Position Mapping & Tag Handling ---
+# Removing extract_tag_mapping and map_clean_to_raw_pos as the required
+# raw_section_slice_start/end_pos data is missing from Stage 2 output.
 AZURE_TAG_PATTERN = re.compile(r'<!--\s*Page(Footer|Number|Break|Header)=?(".*?"|\d+)?\s*-->\s*\n?')
-
-def extract_tag_mapping(raw_content: str) -> list[dict]:
-    """Finds Azure tags and returns their positions and lengths."""
-    tag_mapping = []
-    for match in AZURE_TAG_PATTERN.finditer(raw_content):
-        tag_mapping.append({"start": match.start(), "end": match.end(), "length": match.end() - match.start()})
-    return tag_mapping
-
-def map_clean_to_raw_pos(clean_pos: int, section_raw_start: int, section_tag_mapping: list[dict]) -> int:
-    """Maps a position from cleaned section content back to raw chapter content."""
-    accumulated_tag_length = 0
-    section_tag_mapping.sort(key=lambda t: t["start"]) # Ensure sorted
-    for tag in section_tag_mapping:
-        effective_clean_tag_start = (tag['start'] - section_raw_start) - accumulated_tag_length
-        if clean_pos > effective_clean_tag_start:
-            accumulated_tag_length += tag["length"]
-        else:
-            break # Tags after this point don't affect the mapping
-    return section_raw_start + clean_pos + accumulated_tag_length
 
 # --- Content Splitting ---
 def split_paragraph_by_sentences(paragraph: str, max_tokens: int = CHUNK_SPLIT_MAX_TOKENS) -> List[str]:
@@ -522,30 +505,27 @@ def run_stage3():
         for section in tqdm(merged_sections, desc=f"Chapter {chapter_num} Splitting", leave=False):
             section_token_count = section.get("section_token_count", 0)
             cleaned_content = section.get("cleaned_section_content", "")
-            raw_start = section.get("raw_section_slice_start_pos")
-            raw_end = section.get("raw_section_slice_end_pos")
+            # raw_start = section.get("raw_section_slice_start_pos") # Removed: Data missing from Stage 2
+            # raw_end = section.get("raw_section_slice_end_pos") # Removed: Data missing from Stage 2
 
             if section_token_count <= SECTION_MAX_TOKENS:
                 # Section doesn't need splitting, treat as one chunk
+                # Set start/end pos to None as raw mapping is not possible
                 chunk_data = section.copy() # Start with section metadata
                 chunk_data["part_number"] = 1
                 chunk_data["content"] = cleaned_content # Final content is the cleaned section content
                 chunk_data["chunk_token_count"] = section_token_count
-                chunk_data["start_pos"] = raw_start # Use raw section boundaries
-                chunk_data["end_pos"] = raw_end
+                chunk_data["start_pos"] = None # Set to None as mapping is not possible
+                chunk_data["end_pos"] = None # Set to None as mapping is not possible
                 chunk_data.pop("cleaned_section_content", None) # Remove intermediate field
-                chunk_data.pop("raw_section_slice_start_pos", None)
-                chunk_data.pop("raw_section_slice_end_pos", None)
+                chunk_data.pop("raw_section_slice_start_pos", None) # Remove potentially existing key if present
+                chunk_data.pop("raw_section_slice_end_pos", None) # Remove potentially existing key if present
                 all_initial_chunks.append(chunk_data)
             else:
                 # Section needs splitting
                 logging.debug(f"Splitting Section {section.get('section_number')} (Tokens: {section_token_count})")
-                if raw_start is None or raw_end is None:
-                    logging.error(f"Missing raw start/end positions for section {section.get('section_number')}. Cannot map split chunk positions. Skipping split.")
-                    continue
-
-                # Filter tags relevant to this section's raw slice
-                section_tag_mapping = [t for t in full_tag_mapping if t['start'] >= raw_start and t['end'] <= raw_end]
+                # Removed check for raw_start/raw_end as they are not available/needed for this modified logic
+                # Removed section_tag_mapping filtering as map_clean_to_raw_pos is removed
 
                 split_sub_chunks = split_large_section_content(cleaned_content, CHUNK_SPLIT_MAX_TOKENS)
                 logging.debug(f"  Split into {len(split_sub_chunks)} sub-chunks.")
@@ -567,12 +547,12 @@ def run_stage3():
                     chunk_data["part_number"] = part_num
                     chunk_data["content"] = sub_chunk["content"]
                     chunk_data["chunk_token_count"] = sub_chunk["token_count"]
-                    # Map positions back to raw chapter content
-                    chunk_data["start_pos"] = map_clean_to_raw_pos(sub_chunk['clean_start_pos'], raw_start, section_tag_mapping)
-                    chunk_data["end_pos"] = map_clean_to_raw_pos(sub_chunk['clean_end_pos'], raw_start, section_tag_mapping)
+                    # Set start/end pos to None as mapping is not possible
+                    chunk_data["start_pos"] = None
+                    chunk_data["end_pos"] = None
                     chunk_data.pop("cleaned_section_content", None)
-                    chunk_data.pop("raw_section_slice_start_pos", None)
-                    chunk_data.pop("raw_section_slice_end_pos", None)
+                    chunk_data.pop("raw_section_slice_start_pos", None) # Remove potentially existing key if present
+                    chunk_data.pop("raw_section_slice_end_pos", None) # Remove potentially existing key if present
                     all_initial_chunks.append(chunk_data)
 
     logging.info(f"Generated {len(all_initial_chunks)} initial chunks before final merge.")
